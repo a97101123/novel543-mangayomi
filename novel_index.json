@@ -34,13 +34,13 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
     "apiUrl": "",
-    "version": "0.2.2",
+    "version": "0.2.3",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "BETA v0.2.2: headless WebView fallback for dynamic chapter content"
+    "notes": "BETA v0.2.3: faster headless chapter load, cover fallback, lazy chapter images"
   }
 ]

@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.2",
+  version: "0.2.3",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -49,6 +49,31 @@ class DefaultExtension extends MProvider {
   attr(el, key) { return el ? (el.attr(key) || "") : ""; }
   blank() { return { list: [], hasNextPage: false }; }
 
+  // Prefer the website's direct cover URL over a lazy-load placeholder or
+  // an image host that needs a special Referer.
+  canonicalCover(bookLink) {
+    const id = this.novelId(bookLink);
+    if (!id) return "";
+    return this.source.baseUrl + "/files/article/image/" + Math.floor(Number(id) / 1000) + "/" + id + "/" + id + "s.jpg";
+  }
+
+  meaningfulImage(src) {
+    const value = String(src || "").trim();
+    if (!value || /^(?:data:|blob:|javascript:|#)/i.test(value)) return false;
+    if (/\b(?:blank|placeholder|loading|default[-_]?(?:cover|img)|no[-_]?image)\b/i.test(value)) return false;
+    return true;
+  }
+
+  getImageAttribute(el) {
+    if (!el) return "";
+    const keys = ["data-src", "data-original", "data-lazy-src", "data-echo", "data-url", "src"];
+    for (const key of keys) {
+      const candidate = this.attr(el, key);
+      if (this.meaningfulImage(candidate)) return candidate;
+    }
+    return "";
+  }
+
   // The site has /novel/NNNN.html book URLs.
   bookPath(href) {
     return /\/novel\/\d+\.html(?:[?#].*)?$/i.test(href);
@@ -84,11 +109,12 @@ class DefaultExtension extends MProvider {
       let name = this.txt(titleEl) || this.txt(anchor);
       name = name.replace(/^\d+(?:\.\d+)?\s+/, "").trim();
       if (!name) continue;
-      const cover = this.first(card, ["img[data-original]", "img[data-src]", "img"]);
-      const imageUrl = this.absolute(
-        this.attr(cover, "data-original") || this.attr(cover, "data-src") || this.attr(cover, "src"),
-        pageUrl
-      );
+      const cover = this.first(card, ["img[data-src]", "img[data-original]", "img"]);
+      const observedImage = this.absolute(this.getImageAttribute(cover), pageUrl);
+      const canonicalImage = this.canonicalCover(link);
+      // Images inside listing cards may be JavaScript placeholders or
+      // protected third-party CDN URLs. Prefer the direct book cover path.
+      const imageUrl = canonicalImage || observedImage;
       results.push({ name, link, imageUrl });
       seen.add(link);
     }
@@ -173,6 +199,35 @@ class DefaultExtension extends MProvider {
     };
   }
 
+  // Mangayomi's novel reader requires a real <img src="...">; it does not
+  // necessarily execute the website's lazy-loading JavaScript.
+  normalizeImageTags(html, chapterUrl) {
+    const self = this;
+    return String(html || "").replace(/<img\b[^>]*>/gi, function(tag) {
+      function attr(key) {
+        const re = new RegExp("(?:\\s|^)" + key + "\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s>]+))", "i");
+        const m = tag.match(re);
+        return m ? (m[1] || m[2] || m[3] || "") : "";
+      }
+      let selected = "";
+      for (const key of ["data-src", "data-original", "data-lazy-src", "data-echo", "data-url", "src"]) {
+        const candidate = attr(key);
+        if (self.meaningfulImage(candidate)) { selected = candidate; break; }
+      }
+      if (!selected) {
+        const set = attr("data-srcset") || attr("srcset");
+        selected = set ? set.split(",")[0].trim().split(/\s+/)[0] : "";
+      }
+      if (!self.meaningfulImage(selected)) return "";
+      let finalUrl = self.absolute(selected, chapterUrl);
+      // Previous Legado rules documented this host migration.
+      finalUrl = finalUrl.replace(/^https?:\/\/img1\.readpai\.com\//i, "https://img3.readpai.com/");
+      // Keep img markup small; no lazy attributes or placeholder srcset.
+      const alt = attr("alt").replace(/&/g, "&amp;").replace(/\"/g, "&quot;").replace(/</g, "&lt;");
+      return '<img src="' + finalUrl.replace(/&/g, "&amp;").replace(/\"/g, "&quot;") + '" alt="' + alt + '" />';
+    });
+  }
+
   cleanContent(html, chapterUrl) {
     let s = String(html || "");
     s = s.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
@@ -180,11 +235,7 @@ class DefaultExtension extends MProvider {
     s = s.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, "");
     s = s.replace(/<ins\b[^>]*>[\s\S]*?<\/ins>/gi, "");
     s = s.replace(/<a\b[^>]*>\s*(?:上一章|下一章|目錄|書頁)\s*<\/a>/gi, "");
-    // Keep illustrations if exposed in the chapter HTML.
-    s = s.replace(/(<img\b[^>]*\bsrc=["'])([^"']+)(["'])/gi, (all, pre, src, end) =>
-      pre + this.absolute(src, chapterUrl) + end
-    );
-    return s.trim();
+    return this.normalizeImageTags(s, chapterUrl).trim();
   }
 
   pageBase(path) {
@@ -243,87 +294,122 @@ class DefaultExtension extends MProvider {
     throw new Error("Linovelib：正文容器存在但沒有可用文字。網站可能以 JavaScript 動態載入；請先用 WebView 開啟該章");
   }
 
-  // Browser-rendered fallback for chapters whose source HTML contains no readable text.
-  // This uses Mangayomi's headless WebView bridge, not the manual WebView button.
+  // The source chapter HTML often contains a placeholder rather than text.
+  // Open a *headless* WebView first, avoiding a normally wasted HTTP request.
+  // This is NOT the manual WebView button in the app.
   async readRenderedChapter(chapterUrl) {
     if (typeof evaluateJavascriptViaWebview !== "function") {
-      throw new Error("Linovelib：此 Mangayomi 版本沒有背景 WebView 執行介面");
+      throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
+    const script = String.raw`(function () {
+      if (window.__linovelibCaptureV023) return;
+      window.__linovelibCaptureV023 = true;
+      var finished = false;
+      var start = Date.now();
+      var signature = "";
+      var stableCount = 0;
+      var timer = null;
 
-    const script = `(function () {
-      if (window.__linovelibCaptureActive) return;
-      window.__linovelibCaptureActive = true;
-      var done = false;
-      var started = Date.now();
-      var lastSignature = "";
-      var stable = 0;
-      var timer;
-
-      function send(data) {
-        if (done) return;
-        done = true;
+      function report(value) {
+        if (finished) return;
+        finished = true;
         if (timer) clearInterval(timer);
-        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(data));
+        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
       }
-
+      function validSrc(value) {
+        return !!value && !/^(?:data:|blob:|javascript:|#)/i.test(value) &&
+          !/placeholder|loading|blank|no[-_]?image/i.test(value);
+      }
+      // Copy browser-resolved lazy image URLs into real src attributes.
+      function snapshot(el) {
+        var clone = el.cloneNode(true);
+        var originalImgs = el.querySelectorAll("img");
+        var copiedImgs = clone.querySelectorAll("img");
+        for (var k = 0; k < originalImgs.length; k++) {
+          var original = originalImgs[k];
+          var copied = copiedImgs[k];
+          if (!copied) continue;
+          var src = "";
+          var candidates = ["data-src", "data-original", "data-lazy-src", "data-echo", "data-url", "src"];
+          for (var m = 0; m < candidates.length; m++) {
+            var candidate = original.getAttribute(candidates[m]) || "";
+            if (validSrc(candidate)) { src = candidate; break; }
+          }
+          if (!src && validSrc(original.currentSrc)) src = original.currentSrc;
+          if (!src) {
+            var srcset = original.getAttribute("data-srcset") || original.getAttribute("srcset") || "";
+            var first = srcset.split(",")[0].trim().split(/\s+/)[0];
+            if (validSrc(first)) src = first;
+          }
+          if (src) {
+            try { copied.setAttribute("src", new URL(src, location.href).href); }
+            catch (_) { copied.setAttribute("src", src); }
+          }
+          copied.removeAttribute("srcset");
+          copied.removeAttribute("loading");
+        }
+        return clone.innerHTML;
+      }
       function poll() {
-        var selectors = ["#acontentz", "#acontent", "#TextContent", ".chapter-content"];
+        var selectors = ["#acontent", "#acontentz", "#TextContent", ".chapter-content"];
         var best = null;
         for (var i = 0; i < selectors.length; i++) {
           var el = document.querySelector(selectors[i]);
           if (!el) continue;
-          var html = (el.innerHTML || "").trim();
           var plain = (el.innerText || el.textContent || "").trim();
+          var html = (el.innerHTML || "").trim();
+          var count = el.querySelectorAll("img").length;
           if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain)) continue;
           var len = plain.replace(/\s+/g, "").length;
-          var hasImage = /<img\b/i.test(html);
-          if ((!html || len < 20) && !hasImage) continue;
-          var score = len + (hasImage ? 40 : 0);
-          if (!best || score > best.score) best = {html: html, score: score};
+          if (!html || (len < 80 && count === 0)) continue;
+          var score = len + count * 60;
+          if (!best || score > best.score) best = { el: el, score: score, len: len, count: count };
         }
-
         if (best) {
-          var signature = best.html.length + ":" + best.score;
-          if (signature === lastSignature) stable++;
-          else {lastSignature = signature; stable = 0;}
-          // Wait for successive identical snapshots so that the website's own JS can finish.
-          if (stable >= 3) {
+          var html = snapshot(best.el);
+          var fresh = html.length + ":" + best.len + ":" + best.count + ":" + html.slice(-30);
+          if (fresh === signature) stableCount++;
+          else { signature = fresh; stableCount = 0; }
+          // ~1.5s of stable content, not the old ~2.4s plus HTTP fallback.
+          if (stableCount >= 3 && Date.now() - start >= 1100) {
             var next = (window.ReadParams && window.ReadParams.url_next) || "";
-            send({html: best.html, next: next, error: ""});
+            report({ html: html, next: next, error: "" });
             return;
           }
         }
-        if (Date.now() - started > 29000) {
-          send({html: "", next: "", error: best ? "render_not_stable" : "rendered_content_missing"});
+        if (Date.now() - start > 19000) {
+          report({ html: "", next: "", error: best ? "content_unstable" : "content_missing" });
         }
       }
-      timer = setInterval(poll, 800);
+      timer = setInterval(poll, 500);
       poll();
     })();`;
 
     let result;
     try {
       result = await evaluateJavascriptViaWebview(
-        chapterUrl,
-        this.getHeaders(chapterUrl),
-        [script],
-        35
+        chapterUrl, this.getHeaders(chapterUrl), [script], 24
       );
     } catch (error) {
-      throw new Error("Linovelib：背景 WebView 執行失敗（可能是 Mangayomi 版本或 WebView 環境問題）: " + String(error));
+      throw new Error("Linovelib：背景載入失敗：" + String(error));
     }
     let payload;
-    try {
-      payload = JSON.parse(String(result || ""));
-    } catch (_) {
-      throw new Error("Linovelib：背景 WebView 未回傳有效正文資料，請檢查 Mangayomi 是否支援文字回傳");
-    }
+    try { payload = JSON.parse(String(result || "")); }
+    catch (_) { throw new Error("Linovelib：背景 WebView 沒有回傳有效 JSON"); }
     if (!payload || !payload.html) {
-      throw new Error("Linovelib：背景 WebView 沒有取得正文（" + String(payload?.error || "no_result") + "）");
+      throw new Error("Linovelib：背景載入沒有取得完整正文（" + String(payload?.error || "no_result") + "）");
     }
     const html = this.cleanContent(payload.html, chapterUrl);
-    if (!html) throw new Error("Linovelib：背景 WebView 解析後正文為空");
-    return { html, next: this.absolute(payload.next || "", chapterUrl) };
+    if (!html) throw new Error("Linovelib：背景載入後正文仍為空");
+    return {html, next: this.absolute(payload.next || "", chapterUrl)};
+  }
+
+  isChapterContinuation(currentUrl, nextUrl) {
+    const current = String(currentUrl || "").split(/[?#]/)[0];
+    const next = String(nextUrl || "").split(/[?#]/)[0];
+    if (!current || !next) return false;
+    const base = current.replace(/_\d+\.html$/, ".html").replace(/\.html$/, "");
+    return next.startsWith(base + "_") && /_\d+\.html$/i.test(next);
   }
 
   async getHtmlContent(name, url) {
@@ -333,36 +419,25 @@ class DefaultExtension extends MProvider {
     for (let page = 0; page < 12; page++) {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
-
-      let doc = null;
       let html = "";
       let next = "";
-      let originalError = null;
+      let webviewError = null;
       try {
-        doc = await this.load(currentUrl);
-        html = this.readChapterBody(doc, currentUrl);
-        next = this.nextSubPage(doc, currentUrl);
-      } catch (err) {
-        originalError = err;
+        const rendered = await this.readRenderedChapter(currentUrl);
+        html = rendered.html;
+        if (this.isChapterContinuation(currentUrl, rendered.next)) next = rendered.next;
+      } catch (error) {
+        webviewError = error;
       }
-
+      // HTTP is the fallback now; for most dynamic chapters it cannot see the text.
       if (!html) {
         try {
-          const rendered = await this.readRenderedChapter(currentUrl);
-          html = rendered.html;
-          // Only follow a page link that still belongs to this chapter.
-          if (rendered.next) {
-            const expectedBase = currentUrl.split(/[?#]/)[0]
-              .replace(/\.html$/, "")
-              .replace(/_\d+$/, "");
-            if (rendered.next.startsWith(expectedBase + "_") &&
-                /_\d+\.html(?:[?#].*)?$/.test(rendered.next)) {
-              next = rendered.next;
-            }
-          }
-          if (!next && doc) next = this.nextSubPage(doc, currentUrl);
-        } catch (renderError) {
-          throw new Error("Linovelib：HTTP 正文解析失敗（" + String(originalError) + "）；" + String(renderError));
+          const doc = await this.load(currentUrl);
+          html = this.readChapterBody(doc, currentUrl);
+          const candidate = this.nextSubPage(doc, currentUrl);
+          if (this.isChapterContinuation(currentUrl, candidate)) next = candidate;
+        } catch (err) {
+          throw new Error("Linovelib：背景讀取失敗（" + String(webviewError) + "）；HTTP 備援失敗（" + String(err) + "）");
         }
       }
       parts.push(html);
