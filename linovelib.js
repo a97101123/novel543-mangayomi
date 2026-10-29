@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.1",
+  version: "0.2.2",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -243,6 +243,89 @@ class DefaultExtension extends MProvider {
     throw new Error("Linovelib：正文容器存在但沒有可用文字。網站可能以 JavaScript 動態載入；請先用 WebView 開啟該章");
   }
 
+  // Browser-rendered fallback for chapters whose source HTML contains no readable text.
+  // This uses Mangayomi's headless WebView bridge, not the manual WebView button.
+  async readRenderedChapter(chapterUrl) {
+    if (typeof evaluateJavascriptViaWebview !== "function") {
+      throw new Error("Linovelib：此 Mangayomi 版本沒有背景 WebView 執行介面");
+    }
+
+    const script = `(function () {
+      if (window.__linovelibCaptureActive) return;
+      window.__linovelibCaptureActive = true;
+      var done = false;
+      var started = Date.now();
+      var lastSignature = "";
+      var stable = 0;
+      var timer;
+
+      function send(data) {
+        if (done) return;
+        done = true;
+        if (timer) clearInterval(timer);
+        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(data));
+      }
+
+      function poll() {
+        var selectors = ["#acontentz", "#acontent", "#TextContent", ".chapter-content"];
+        var best = null;
+        for (var i = 0; i < selectors.length; i++) {
+          var el = document.querySelector(selectors[i]);
+          if (!el) continue;
+          var html = (el.innerHTML || "").trim();
+          var plain = (el.innerText || el.textContent || "").trim();
+          if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain)) continue;
+          var len = plain.replace(/\s+/g, "").length;
+          var hasImage = /<img\b/i.test(html);
+          if ((!html || len < 20) && !hasImage) continue;
+          var score = len + (hasImage ? 40 : 0);
+          if (!best || score > best.score) best = {html: html, score: score};
+        }
+
+        if (best) {
+          var signature = best.html.length + ":" + best.score;
+          if (signature === lastSignature) stable++;
+          else {lastSignature = signature; stable = 0;}
+          // Wait for successive identical snapshots so that the website's own JS can finish.
+          if (stable >= 3) {
+            var next = (window.ReadParams && window.ReadParams.url_next) || "";
+            send({html: best.html, next: next, error: ""});
+            return;
+          }
+        }
+        if (Date.now() - started > 29000) {
+          send({html: "", next: "", error: best ? "render_not_stable" : "rendered_content_missing"});
+        }
+      }
+      timer = setInterval(poll, 800);
+      poll();
+    })();`;
+
+    let result;
+    try {
+      result = await evaluateJavascriptViaWebview(
+        chapterUrl,
+        this.getHeaders(chapterUrl),
+        [script],
+        35
+      );
+    } catch (error) {
+      throw new Error("Linovelib：背景 WebView 執行失敗（可能是 Mangayomi 版本或 WebView 環境問題）: " + String(error));
+    }
+    let payload;
+    try {
+      payload = JSON.parse(String(result || ""));
+    } catch (_) {
+      throw new Error("Linovelib：背景 WebView 未回傳有效正文資料，請檢查 Mangayomi 是否支援文字回傳");
+    }
+    if (!payload || !payload.html) {
+      throw new Error("Linovelib：背景 WebView 沒有取得正文（" + String(payload?.error || "no_result") + "）");
+    }
+    const html = this.cleanContent(payload.html, chapterUrl);
+    if (!html) throw new Error("Linovelib：背景 WebView 解析後正文為空");
+    return { html, next: this.absolute(payload.next || "", chapterUrl) };
+  }
+
   async getHtmlContent(name, url) {
     let currentUrl = url;
     const visited = new Set();
@@ -250,9 +333,39 @@ class DefaultExtension extends MProvider {
     for (let page = 0; page < 12; page++) {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
-      const doc = await this.load(currentUrl);
-      parts.push(this.readChapterBody(doc, currentUrl));
-      const next = this.nextSubPage(doc, currentUrl);
+
+      let doc = null;
+      let html = "";
+      let next = "";
+      let originalError = null;
+      try {
+        doc = await this.load(currentUrl);
+        html = this.readChapterBody(doc, currentUrl);
+        next = this.nextSubPage(doc, currentUrl);
+      } catch (err) {
+        originalError = err;
+      }
+
+      if (!html) {
+        try {
+          const rendered = await this.readRenderedChapter(currentUrl);
+          html = rendered.html;
+          // Only follow a page link that still belongs to this chapter.
+          if (rendered.next) {
+            const expectedBase = currentUrl.split(/[?#]/)[0]
+              .replace(/\.html$/, "")
+              .replace(/_\d+$/, "");
+            if (rendered.next.startsWith(expectedBase + "_") &&
+                /_\d+\.html(?:[?#].*)?$/.test(rendered.next)) {
+              next = rendered.next;
+            }
+          }
+          if (!next && doc) next = this.nextSubPage(doc, currentUrl);
+        } catch (renderError) {
+          throw new Error("Linovelib：HTTP 正文解析失敗（" + String(originalError) + "）；" + String(renderError));
+        }
+      }
+      parts.push(html);
       if (!next) return parts.join("\n<hr/>\n");
       currentUrl = next;
     }
