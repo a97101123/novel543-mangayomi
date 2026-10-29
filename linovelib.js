@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.0",
+  version: "0.2.1",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -212,6 +212,37 @@ class DefaultExtension extends MProvider {
     return next;
   }
 
+  // Read the *first non-empty* recognized chapter container.
+  // Some pages contain #acontentz but populate #acontent instead.
+  readChapterBody(doc, chapterUrl) {
+    const selectors = ["#acontent", "#acontentz", "#TextContent", ".chapter-content"];
+    let anyContainer = false;
+    for (const selector of selectors) {
+      const el = doc.selectFirst(selector);
+      if (!el) continue;
+      anyContainer = true;
+      let raw = String(el.innerHtml || "").trim();
+      // Some parser versions expose only text, not innerHtml.
+      if (!raw && String(el.text || "").trim()) {
+        raw = "<p>" + String(el.text).replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</p>";
+      }
+      const html = this.cleanContent(raw, chapterUrl);
+      const plain = String(el.text || "").trim();
+      // A loading message is not genuine chapter content.
+      const failure = /內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i;
+      if (failure.test(plain + " " + html)) continue;
+      // Empty tags or ads must not prevent trying the next selector.
+      const hasText = plain.length > 0 || html.replace(/<[^>]*>/g, "").replace(/&nbsp;|\s/g, "").trim().length > 0;
+      const hasImage = /<img\b/i.test(html);
+      if (html && (hasText || hasImage)) return html;
+    }
+    if (!anyContainer) {
+      throw new Error("Linovelib：找不到正文容器；請檢查章節網址或在 WebView 開啟");
+    }
+    throw new Error("Linovelib：正文容器存在但沒有可用文字。網站可能以 JavaScript 動態載入；請先用 WebView 開啟該章");
+  }
+
   async getHtmlContent(name, url) {
     let currentUrl = url;
     const visited = new Set();
@@ -220,15 +251,7 @@ class DefaultExtension extends MProvider {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
       const doc = await this.load(currentUrl);
-      const content = this.first(doc, ["#acontentz", "#acontent", "#TextContent", ".chapter-content"]);
-      if (!content) throw new Error("Linovelib：找不到正文容器，可能需要在 WebView 閱讀");
-      const html = this.cleanContent(content.innerHtml || "", currentUrl);
-      const text = this.txt(content);
-      if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入/.test(text + " " + html)) {
-        throw new Error("Linovelib：網站只回傳部分正文，請使用網站 WebView 閱讀");
-      }
-      if (!html) throw new Error("Linovelib：正文為空");
-      parts.push(html);
+      parts.push(this.readChapterBody(doc, currentUrl));
       const next = this.nextSubPage(doc, currentUrl);
       if (!next) return parts.join("\n<hr/>\n");
       currentUrl = next;
