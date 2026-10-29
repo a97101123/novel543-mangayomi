@@ -1,0 +1,24 @@
+[
+  {
+    "name": "稷下書院 Novel543",
+    "id": 54303026,
+    "baseUrl": "https://www.novel543.com",
+    "lang": "zh",
+    "typeSource": "single",
+    "iconUrl": "https://www.novel543.com/favicon.ico",
+    "dateFormat": "",
+    "dateFormatLocale": "",
+    "isNsfw": false,
+    "hasCloudflare": true,
+    "sourceCodeUrl": "https://raw.githubusercontent.com/YOUR_USERNAME/novel543-mangayomi/main/novel543.js",
+    "apiUrl": "",
+    "version": "0.3.0",
+    "isManga": false,
+    "itemType": 2,
+    "isFullData": false,
+    "appMinVerReq": "0.5.0",
+    "additionalParams": "",
+    "sourceCodeLanguage": 1,
+    "notes": "Novel543; merges multipart chapters"
+  }
+]
