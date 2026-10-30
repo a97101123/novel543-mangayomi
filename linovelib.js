@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.15",
+  version: "0.2.16",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -880,7 +880,15 @@ class DefaultExtension extends MProvider {
       html = body ? String(body.innerHtml || "") : "";
       match = html.match(/\burl_next\s*:\s*['"]([^'"]+\.html)['"]/i);
     }
-    if (!match) return "";
+    if (!match) {
+      // PC/alternate mobile layouts may expose the immediate continuation
+      // as an HTML pagination anchor rather than ReadParams.url_next.
+      for (const link of doc.select(".mlfy_page a[href], .read-page a[href], .pager a[href], .page-next a[href]")) {
+        const candidate = this.absolute(this.attr(link, "href"), currentUrl);
+        if (this.isChapterContinuation(currentUrl, candidate)) return candidate;
+      }
+      return "";
+    }
     const next = this.absolute(match[1], currentUrl);
     const current = currentUrl.split(/[?#]/)[0];
     // Valid continuation: 263394.html -> 263394_2.html -> 263394_3.html
@@ -890,55 +898,124 @@ class DefaultExtension extends MProvider {
     return next;
   }
 
-  // Read the *first non-empty* recognized chapter container.
-  // Some pages contain #acontentz but populate #acontent instead.
-  readChapterBody(doc, chapterUrl) {
-    const selectors = ["#acontent1", "#acontentz", "#acontent", "#TextContent", ".chapter-content", "#ccacontent"];
-    let anyContainer = false;
-    for (const selector of selectors) {
-      const el = doc.selectFirst(selector);
-      if (!el) continue;
-      anyContainer = true;
-      let raw = String(el.innerHtml || "").trim();
-      // Some parser versions expose only text, not innerHtml.
-      if (!raw && String(el.text || "").trim()) {
-        raw = "<p>" + String(el.text).replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</p>";
+  // HTTP-first path: an HTTP response is fast only if it really contains the
+  // complete chapter rather than a loading placeholder. Do not silently
+  // accept challenge text, font-obfuscated glyphs, or a partial article.
+  declaredContentId(doc) {
+    try {
+      for (const script of doc.select("script")) {
+        const text = String(script.innerHtml || script.text || "");
+        const found = text.match(/\bcontentid\s*:\s*['"]([A-Za-z][\w:-]{0,70})['"]/i);
+        if (found) return found[1];
       }
-      const html = this.cleanContent(raw, chapterUrl, this.txt(doc.selectFirst("#atitle")));
-      const plain = String(el.text || "").trim();
-      // A loading message is not genuine chapter content.
-      const failure = /內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i;
-      if (failure.test(plain + " " + html)) continue;
-      // Empty tags or ads must not prevent trying the next selector.
-      const hasText = plain.length > 0 || html.replace(/<[^>]*>/g, "").replace(/&nbsp;|\s/g, "").trim().length > 0;
-      const hasImage = /<img\b/i.test(html);
-      if (html && (hasText || hasImage)) return html;
-    }
-    if (!anyContainer) {
-      throw new Error("Linovelib：找不到正文容器；請檢查章節網址或在 WebView 開啟");
-    }
-    throw new Error("Linovelib：正文容器存在但沒有可用文字。網站可能以 JavaScript 動態載入；請先用 WebView 開啟該章");
+    } catch (_) {}
+    return "";
   }
 
-  // Chapter-only, single request with a short network timeout. Regular
-  // book/catalogue requests keep their existing reliability behavior.
-  // A 429 is a server rate limit, never something to retry in a tight loop.
+  // Mirror the previous WebView paragraph-permutation algorithm without
+  // evaluating any site JS. Preserve every non-paragraph node (especially
+  // illustration markup) in its original location. Reject ambiguous nested
+  // paragraph layouts rather than risking a damaged chapter.
+  restoreHttpParagraphOrder(html, container, chapterUrl) {
+    const text = String(html || "");
+    const pattern = /<p\b[^>]*>[\s\S]*?<\/p\s*>/gi;
+    const matches = Array.from(text.matchAll(pattern));
+    const usable = matches.filter(m => m[0].replace(/<[^>]*>/g, "").replace(/\s/g, "") || /<img\b/i.test(m[0]));
+    if (usable.length <= 20) return text;
+    if (usable.length > 600) throw new Error("Linovelib：HTTP 段落過多，改用瀏覽器驗證");
+    // Document.children excludes text nodes; that is deliberate. The previous
+    // WebView restoration also permutes *direct* nonempty <p> children only.
+    const direct = (container.children || []).filter(node =>
+      String(node.localName || "").toLowerCase() === "p" &&
+      String(node.innerHtml || "").replace(/\s/g, "").length > 0);
+    if (direct.length !== usable.length) {
+      throw new Error("Linovelib：HTTP 段落層級不明，改用瀏覽器驗證");
+    }
+    for (let i = 0; i < direct.length; i++) {
+      if (String(direct[i].outerHtml || "") !== usable[i][0]) {
+        throw new Error("Linovelib：HTTP 段落標記不一致，改用瀏覽器驗證");
+      }
+    }
+    const match = String(chapterUrl || "").match(/\/novel\/\d+\/(\d+)(?:_\d+)?\.html(?:[?#]|$)/i);
+    if (!match || !Number.isSafeInteger(Number(match[1]))) {
+      throw new Error("Linovelib：章節編號無法驗證，改用瀏覽器");
+    }
+    const permutation = usable.map((_, i) => i);
+    let seed = Number(match[1]) * 126 + 232;
+    for (let i = permutation.length - 1; i > 20; i--) {
+      seed = (seed * 9302 + 49397) % 233280;
+      const j = 20 + Math.floor(seed / 233280 * (i - 20 + 1));
+      const temp = permutation[i]; permutation[i] = permutation[j]; permutation[j] = temp;
+    }
+    const sorted = usable.map(m => m[0]);
+    for (let raw = 0; raw < usable.length; raw++) sorted[permutation[raw]] = usable[raw][0];
+    let cursor = 0, j = 0, output = "";
+    for (const m of matches) {
+      output += text.slice(cursor, m.index);
+      const included = !!(m[0].replace(/<[^>]*>/g, "").replace(/\s/g, "") || /<img\b/i.test(m[0]));
+      output += included ? sorted[j++] : m[0];
+      cursor = m.index + m[0].length;
+    }
+    return output + text.slice(cursor);
+  }
+
+  readHttpChapter(doc, chapterUrl) {
+    const declared = this.declaredContentId(doc);
+    const selectors = [];
+    if (declared) selectors.push("#" + declared);
+    selectors.push("#acontent1", "#acontentz", "#acontent", "#TextContent", ".chapter-content", "#ccacontent");
+    let best = null;
+    const seen = new Set();
+    for (const selector of selectors) {
+      if (seen.has(selector)) continue;
+      seen.add(selector);
+      const container = doc.selectFirst(selector);
+      const raw = String(container?.innerHtml || "").trim();
+      if (!raw) continue;
+      const plain = String(container?.text || "").replace(/\s+/g, "");
+      const images = (raw.match(/<img\b/gi) || []).length;
+      if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示|正在加載|正在加载/i.test(plain.slice(0,160))) continue;
+      if ((plain.length < 120 && !images) || (plain.length < 35 && images < 1)) continue;
+      // These fonts substitute characters at paint time; plain HTTP cannot
+      // reconstruct them reliably. A rendered browser remains necessary.
+      if ((plain.match(/[\uE000-\uF8FF]/g) || []).length >= 3 ||
+          /font-family\s*:\s*['"]?read(?:[;'",\s]|$)/i.test(raw)) continue;
+      const paragraphCount = (raw.match(/<p\b/gi) || []).length;
+      if (images === 0 && paragraphCount < 2 && plain.length < 500) continue;
+      const score = plain.length + images * 80 + paragraphCount * 5;
+      if (!best || score > best.score) best = {container, raw, score};
+    }
+    if (!best) throw new Error("Linovelib：HTTP 正文尚未完整載入（content_missing），改用背景 WebView");
+    const reordered = this.restoreHttpParagraphOrder(best.raw, best.container, chapterUrl);
+    const html = this.cleanContent(reordered, chapterUrl,
+      this.txt(doc.selectFirst("#atitle")));
+    const meaningful = html.replace(/<(?:script|style)\b[^>]*>[\s\S]*?<\/(?:script|style)>/gi, "")
+      .replace(/<[^>]*>/g, "").replace(/&nbsp;|&#160;|\s/gi, "").trim();
+    if ((!meaningful && !/<img\b/i.test(html)) ||
+        (meaningful.length < 120 && !/<img\b/i.test(html))) {
+      throw new Error("Linovelib：HTTP 回應僅有佔位內容，改用背景 WebView");
+    }
+    return {html, next: this.nextSubPage(doc, chapterUrl)};
+  }
+
+  // Chapter HTTP requests get one short attempt. 429 is terminal for this
+  // reading action: repeatedly opening more connections makes limits worse.
   async loadChapterOnce(url) {
-    const response = await new Client({timeout: 7}).get(url, this.getHeaders(url));
+    const response = await new Client({timeout: 6}).get(url, this.getHeaders(url));
     const status = Number(response?.statusCode ?? response?.status ?? 0);
-    if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試");
+    if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試，勿連續重試");
     if (status === 403 || status === 401) throw new Error("Linovelib：網站要求驗證（HTTP " + status + "）");
     if (status >= 400 || !response?.body) throw new Error("Linovelib：HTTP " + status + " 或空白回應");
-    return new Document(String(response.body));
+    const body = String(response.body);
+    if (/cf-challenge|challenge-platform|<title[^>]*>\s*(?:Just a moment|Checking your browser)/i.test(body.slice(0,5000))) {
+      throw new Error("Linovelib：網站要求驗證，HTTP 取得的是驗證頁");
+    }
+    return new Document(body);
   }
 
-  // The source chapter HTML often contains a placeholder rather than text.
-  // Open a *headless* WebView first, avoiding a normally wasted HTTP request.
-  // This is NOT the manual WebView button in the app.
-  // Rendered WebView is the only request in the normal path. Unlike the old
-  // 19s polling loop, find the site's declared content id (ReadTools.contentid)
-  // and return as soon as the complete chapter DOM is stable.
+  // Fallback only: render JavaScript-created or font-obfuscated chapter text
+  // when static HTML cannot be verified. This is a headless WebView, not the
+  // manual WebView button. Keep the v0.2.15 stable-content capture behavior.
   async readRenderedChapter(chapterUrl) {
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
@@ -1127,49 +1204,72 @@ class DefaultExtension extends MProvider {
   isChapterContinuation(currentUrl, nextUrl) {
     const current = String(currentUrl || "").split(/[?#]/)[0];
     const next = String(nextUrl || "").split(/[?#]/)[0];
-    if (!current || !next) return false;
-    const base = current.replace(/_\d+\.html$/, ".html").replace(/\.html$/, "");
-    return next.startsWith(base + "_") && /_\d+\.html$/i.test(next);
+    // Require the immediate next subpage, never another chapter or a skipped
+    // part; this prevents silently returning incomplete text.
+    const prev = current.match(/^(https?:\/\/[^/]+\/novel\/\d+\/\d+)(?:_(\d+))?\.html$/i);
+    const after = next.match(/^(https?:\/\/[^/]+\/novel\/\d+\/\d+)_(\d+)\.html$/i);
+    return !!prev && !!after && prev[1] === after[1] &&
+      Number(after[2]) === (prev[2] ? Number(prev[2]) : 1) + 1;
+  }
+
+  // A pointer to a later page of the *same* chapter must not silently
+  // terminate the chapter if a part is skipped or duplicated.
+  checkedContinuation(currentUrl, candidateUrl) {
+    if (!candidateUrl) return "";
+    if (this.isChapterContinuation(currentUrl, candidateUrl)) return candidateUrl;
+    const base = String(currentUrl || "").split(/[?#]/)[0]
+      .replace(/_\d+\.html$/i, ".html").replace(/\.html$/i, "");
+    const path = String(candidateUrl || "").split(/[?#]/)[0];
+    if (path.startsWith(base + "_") && /_\d+\.html$/i.test(path)) {
+      throw new Error("Linovelib：網站分頁不連續，為避免漏頁已停止（" + path + "）");
+    }
+    return "";
   }
 
   async getHtmlContent(name, url) {
     let currentUrl = url;
     const visited = new Set();
     const parts = [];
-    for (let page = 0; page < 12; page++) {
+    // More than seven pages is fine. The actual page count comes only from
+    // verified website navigation, not guessed URLs. Stop at a safety cap.
+    for (let page = 0; page < 24; page++) {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
-      let html = "";
-      let next = "";
-      let webviewError = null;
+      let html = "", next = "", httpError = null, browserError = null;
       try {
-        const rendered = await this.readRenderedChapter(currentUrl);
-        html = rendered.html;
-        if (this.isChapterContinuation(currentUrl, rendered.next)) next = rendered.next;
+        const doc = await this.loadChapterOnce(currentUrl);
+        const parsed = this.readHttpChapter(doc, currentUrl);
+        const checkedNext = this.checkedContinuation(currentUrl, parsed.next);
+        html = parsed.html;
+        next = checkedNext;
       } catch (error) {
-        webviewError = error;
+        if (/分頁不連續/.test(String(error))) throw error;
+        httpError = error;
       }
-      // Don't send another request when the server has explicitly rate-limited
-      // or challenged the browser; this only adds latency and may worsen 429.
-      if (!html && /HTTP 429|要求驗證|verification_required|rate_limited/.test(String(webviewError || ""))) {
-        throw webviewError;
+      // A genuine HTTP 429 must not trigger a WebView as an extra request.
+      if (!html && /HTTP 429|限制請求頻率|請求過於頻繁/.test(String(httpError || ""))) {
+        throw httpError;
       }
-      // One short HTTP attempt is reserved for unexpected browser failures.
       if (!html) {
         try {
-          const doc = await this.loadChapterOnce(currentUrl);
-          html = this.readChapterBody(doc, currentUrl);
-          const candidate = this.nextSubPage(doc, currentUrl);
-          if (this.isChapterContinuation(currentUrl, candidate)) next = candidate;
-        } catch (err) {
-          throw new Error("Linovelib：背景讀取失敗（" + String(webviewError) + "）；HTTP 備援失敗（" + String(err) + "）");
+          const rendered = await this.readRenderedChapter(currentUrl);
+          const checkedNext = this.checkedContinuation(currentUrl, rendered.next);
+          html = rendered.html;
+          next = checkedNext;
+        } catch (error) {
+          if (/分頁不連續/.test(String(error))) throw error;
+          browserError = error;
         }
+      }
+      if (!html) {
+        if (/HTTP 429|rate_limited|要求驗證|verification_required/.test(String(browserError || ""))) throw browserError;
+        throw new Error("Linovelib：HTTP 讀取失敗（" + String(httpError) + "）；背景 WebView 也無法取得正文（" + String(browserError) + "）");
       }
       parts.push(html);
       if (!next) return parts.join("\n<hr/>\n");
       currentUrl = next;
     }
-    throw new Error("Linovelib：章節超過 12 頁，為避免截斷請檢查分頁");
+    throw new Error("Linovelib：章節分頁超過 24 頁，為避免截斷已停止");
   }
 
   getFilterList() { return []; }
