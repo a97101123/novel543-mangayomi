@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.17",
+  version: "0.2.18",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -985,7 +985,10 @@ class DefaultExtension extends MProvider {
       if (!raw) continue;
       const plain = String(container?.text || "").replace(/\s+/g, "");
       const images = (raw.match(/<img\b/gi) || []).length;
-      if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示|正在加載|正在加载/i.test(plain.slice(0,160))) continue;
+      // Very long merged chapters may show a long valid-looking prefix and
+      // then a site failure marker at the END. Reject it rather than treating
+      // truncated text as a complete page.
+      if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示|正在加載|正在加载/i.test(plain.slice(0,160) + " " + plain.slice(-450))) continue;
       if ((plain.length < 120 && !images) || (plain.length < 35 && images < 1)) continue;
       // These fonts substitute characters at paint time; plain HTTP cannot
       // reconstruct them reliably. A rendered browser remains necessary.
@@ -1159,7 +1162,7 @@ class DefaultExtension extends MProvider {
             var plain = String(el.innerText || el.textContent || "").trim();
             var count = el.querySelectorAll("img").length;
             var len = plain.replace(/\s+/g, "").length;
-            if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain.slice(0,140))) continue;
+            if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain.slice(0,140) + " " + plain.slice(-450))) continue;
             // Don't accept a loading placeholder, menu, or empty chapter.
             if ((len < 75 && count===0) || !String(el.innerHTML||"").trim()) continue;
             var para = el.querySelectorAll("p").length;
@@ -1237,50 +1240,87 @@ class DefaultExtension extends MProvider {
     return "";
   }
 
+  // A catalog item may group 6-8 original chapters (e.g. book 5298).
+  // Follow only the site's verified immediate next-page links; never guess a
+  // URL merely because the title says "Chapter 1-6".
+  // 128 is a failsafe, not a claim that a book has 128 pages.
+  maxPagesPerChapter(url) { return 128; }
+
+  isRateLimitFailure(error) {
+    return /(?:HTTP\s*429|rate_limited|限制請求頻率|請求過於頻繁|Too Many Requests)/i.test(String(error || ""));
+  }
+
   async getHtmlContent(name, url) {
     let currentUrl = url;
     const visited = new Set();
     const parts = [];
-    // More than seven pages is fine. The actual page count comes only from
-    // verified website navigation, not guessed URLs. Stop at a safety cap.
-    for (let page = 0; page < 24; page++) {
-      if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
+    const limit = this.maxPagesPerChapter(url);
+    // If HTTP could not get readable content but WebView could, use the
+    // browser FIRST on subsequent pages: this avoids a wasted HTTP request
+    // for every part of a very long chapter. No parallel/automatic prefetch.
+    let preferred = "http";
+    for (let page = 1; page <= limit; page++) {
+      if (visited.has(currentUrl))
+        throw new Error("Linovelib：章節分頁循環，第 " + page + " 頁（" + currentUrl + "）");
       visited.add(currentUrl);
       let html = "", next = "", httpError = null, browserError = null;
-      try {
-        const doc = await this.loadChapterOnce(currentUrl);
-        const parsed = this.readHttpChapter(doc, currentUrl);
-        const checkedNext = this.checkedContinuation(currentUrl, parsed.next);
-        html = parsed.html;
-        next = checkedNext;
-      } catch (error) {
-        if (/分頁不連續/.test(String(error))) throw error;
-        httpError = error;
-      }
-      // A genuine HTTP 429 must not trigger a WebView as an extra request.
-      if (!html && /HTTP 429|限制請求頻率|請求過於頻繁/.test(String(httpError || ""))) {
-        throw httpError;
-      }
-      if (!html) {
+
+      const tryHttp = async () => {
+        try {
+          const doc = await this.loadChapterOnce(currentUrl);
+          const parsed = this.readHttpChapter(doc, currentUrl);
+          // Validate before accepting content; never return truncated prose.
+          next = this.checkedContinuation(currentUrl, parsed.next);
+          html = parsed.html;
+          preferred = "http";
+        } catch (e) {
+          if (/分頁不連續/.test(String(e)) || this.isRateLimitFailure(e)) throw e;
+          httpError = e;
+        }
+      };
+      const tryBrowser = async () => {
         try {
           const rendered = await this.readRenderedChapter(currentUrl);
-          const checkedNext = this.checkedContinuation(currentUrl, rendered.next);
+          next = this.checkedContinuation(currentUrl, rendered.next);
           html = rendered.html;
-          next = checkedNext;
-        } catch (error) {
-          if (/分頁不連續/.test(String(error))) throw error;
-          browserError = error;
+          preferred = "browser";
+        } catch (e) {
+          if (/分頁不連續/.test(String(e)) || this.isRateLimitFailure(e)) throw e;
+          browserError = e;
         }
+      };
+
+      try {
+        if (preferred === "browser") {
+          await tryBrowser();
+          if (!html) await tryHttp();
+        } else {
+          await tryHttp();
+          if (!html) await tryBrowser();
+        }
+      } catch (error) {
+        // 429 is a server-enforced limit: stop immediately, do not send a
+        // second request through a different transport and worsen the block.
+        if (this.isRateLimitFailure(error)) {
+          throw new Error("Linovelib：讀取第 " + page + " 頁遇到 HTTP 429（網站限流）。已停止後續請求；請稍後再試，不要連續按 Retry。" );
+        }
+        throw new Error("Linovelib：第 " + page + " 頁驗證失敗：" + String(error));
       }
+
       if (!html) {
-        if (/HTTP 429|rate_limited|要求驗證|verification_required/.test(String(browserError || ""))) throw browserError;
-        throw new Error("Linovelib：HTTP 讀取失敗（" + String(httpError) + "）；背景 WebView 也無法取得正文（" + String(browserError) + "）");
+        throw new Error("Linovelib：第 " + page + " 頁未取得完整內容。HTTP：" +
+          String(httpError || "未執行") + "；WebView：" + String(browserError || "未執行") +
+          "。未返回不完整章節。");
       }
       parts.push(html);
       if (!next) return parts.join("\n<hr/>\n");
+      if (page === limit) {
+        throw new Error("Linovelib：章節已有 " + limit +
+          " 個網站分頁，仍有下一頁。為避免缺頁已停止；這可能超過 Mangayomi 一次讀取的能力。");
+      }
       currentUrl = next;
     }
-    throw new Error("Linovelib：章節分頁超過 24 頁，為避免截斷已停止");
+    throw new Error("Linovelib：章節分頁超過安全上限，未返回截斷內容");
   }
 
   getFilterList() { return []; }
