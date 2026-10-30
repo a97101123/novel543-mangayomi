@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.12",
+  version: "0.2.13",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -704,33 +704,94 @@ class DefaultExtension extends MProvider {
     }
   }
 
-  // Mangayomi's novel reader requires a real <img src="...">; it does not
-  // necessarily execute the website's lazy-loading JavaScript.
-  normalizeImageTags(html, chapterUrl) {
-    const self = this;
-    return String(html || "").replace(/<img\b[^>]*>/gi, function(tag) {
-      function attr(key) {
-        const re = new RegExp("(?:\\s|^)" + key + "\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s>]+))", "i");
-        const m = tag.match(re);
-        return m ? (m[1] || m[2] || m[3] || "") : "";
+  // Preserve HTML image nodes and their metadata; only repair URL-bearing
+  // attributes. Mangayomi currently hides <img> in online novels, but these
+  // real URLs remain ready for a reader update. Do not turn novels into manga.
+  readerImageUrl(value, pageUrl) {
+    const raw = String(value || "").trim().replace(/&amp;/gi, "&");
+    if (!raw || /^(?:javascript:|blob:|#)/i.test(raw)) return "";
+    if (/^data:image\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith("//")) return "https:" + raw;
+    const baseUrl = String(pageUrl || this.source.baseUrl + "/");
+    const origin = (baseUrl.match(/^https?:\/\/[^/]+/i) || [this.source.baseUrl])[0];
+    const basePath = baseUrl.replace(/^https?:\/\/[^/]+/i, "").split(/[?#]/)[0];
+    const cut = raw.search(/[?#]/);
+    const pathname = cut < 0 ? raw : raw.slice(0, cut);
+    const suffix = cut < 0 ? "" : raw.slice(cut);
+    const rawPath = pathname.startsWith("/") ? pathname
+      : basePath.slice(0, basePath.lastIndexOf("/") + 1) + pathname;
+    const segments = [];
+    for (const segment of rawPath.split("/")) {
+      if (!segment || segment === ".") continue;
+      if (segment === "..") segments.pop();
+      else segments.push(segment);
+    }
+    return origin + "/" + segments.join("/") + suffix;
+  }
+
+  readerImageAttr(tag, key) {
+    const re = new RegExp("(?:^|\\s)" + key + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i");
+    const m = String(tag).match(re);
+    return m ? (m[1] || m[2] || m[3] || "") : "";
+  }
+
+  readerImageSetAttr(tag, key, value) {
+    const safe = String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const re = new RegExp("\\s+" + key + "\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", "i");
+    if (re.test(tag)) return tag.replace(re, ' ' + key + '="' + safe + '"');
+    return tag.replace(/\s*\/?>$/, end => ' ' + key + '="' + safe + '"' + (end.includes("/") ? ' />' : '>'));
+  }
+
+  readerImageSrcset(raw, pageUrl) {
+    return String(raw || "").split(",").map(entry => {
+      const p = entry.trim().match(/^(\S+)(\s+.*)?$/);
+      if (!p) return entry;
+      const url = this.readerImageUrl(p[1], pageUrl);
+      return url ? url + (p[2] || "") : entry;
+    }).join(", ");
+  }
+
+  preserveReaderImages(html, pageUrl) {
+    let output = String(html || "");
+    // Images in noscript are legitimate fallbacks on some novel sites.
+    output = output.replace(/<noscript\b[^>]*>([\s\S]*?)<\/noscript>/gi,
+      (all, inner) => /<(?:img|picture|figure)\b/i.test(inner) ? inner : "");
+    output = output.replace(/<(?:img|source)\b[^>]*>/gi, tag => {
+      // Preserve alt, captions, width, height, class, figure/picture layout,
+      // existing links and data-* attributes. Eliminate executable handlers.
+      let repaired = tag.replace(/\s+on(?:load|error|click)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+      const isImg = /^<img\b/i.test(tag);
+      const originalSet = this.readerImageAttr(repaired, "data-srcset") ||
+        this.readerImageAttr(repaired, "srcset");
+      if (originalSet) {
+        const set = this.readerImageSrcset(originalSet, pageUrl);
+        if (set && !/^data:/i.test(set)) repaired = this.readerImageSetAttr(repaired, "srcset", set);
       }
-      let selected = "";
-      for (const key of ["data-src", "data-original", "data-lazy-src", "data-echo", "data-url", "src"]) {
-        const candidate = attr(key);
-        if (self.meaningfulImage(candidate)) { selected = candidate; break; }
+      if (!isImg) return repaired;
+      let src = "";
+      for (const key of ["data-src", "data-original", "data-lazy-src", "data-echo",
+                         "data-url", "data-lazyload", "data-img", "src"]) {
+        const value = this.readerImageAttr(repaired, key).trim();
+        if (!value || /^(?:about:blank|#|javascript:|blob:)/i.test(value)) continue;
+        if (/^data:image\/(?:gif|png);base64,/i.test(value) && value.length < 180) continue;
+        if (/placeholder|loading(?:\.gif|\.png)|blank\.gif|no[-_]?image/i.test(value)) continue;
+        src = value; break;
       }
-      if (!selected) {
-        const set = attr("data-srcset") || attr("srcset");
-        selected = set ? set.split(",")[0].trim().split(/\s+/)[0] : "";
-      }
-      if (!self.meaningfulImage(selected)) return "";
-      let finalUrl = self.absolute(selected, chapterUrl);
-      // Previous Legado rules documented this host migration.
-      finalUrl = finalUrl.replace(/^https?:\/\/img1\.readpai\.com\//i, "https://img3.readpai.com/");
-      // Keep img markup small; no lazy attributes or placeholder srcset.
-      const alt = attr("alt").replace(/&/g, "&amp;").replace(/\"/g, "&quot;").replace(/</g, "&lt;");
-      return '<img src="' + finalUrl.replace(/&/g, "&amp;").replace(/\"/g, "&quot;") + '" alt="' + alt + '" />';
+      if (!src && originalSet) src = originalSet.split(",")[0].trim().split(/\s+/)[0];
+      const resolved = this.readerImageUrl(src, pageUrl);
+      if (resolved) repaired = this.readerImageSetAttr(repaired, "src", resolved);
+      // If the source supplied only a placeholder, retain its original tag so
+      // evidence of an unresolved image is not silently deleted.
+      return repaired;
     });
+    return output;
+  }
+
+  normalizeImageTags(html, chapterUrl) {
+    // Preserve original image HTML, including picture/source, lazy attributes,
+    // title/alt/size and surrounding figure captions.
+    return this.preserveReaderImages(html, chapterUrl);
   }
 
   cleanContent(html, chapterUrl, chapterTitle = "") {
@@ -923,8 +984,6 @@ class DefaultExtension extends MProvider {
             try { copied.setAttribute("src", new URL(src, location.href).href); }
             catch (_) { copied.setAttribute("src", src); }
           }
-          copied.removeAttribute("srcset");
-          copied.removeAttribute("loading");
         }
         return clone.innerHTML;
       }

@@ -1,5 +1,5 @@
 // Mangayomi JavaScript novel source — independently implemented for Masiro.
-// v0.1.0 beta. Requires the reader's own, authorized Masiro login session.
+// v0.1.2 beta. Paid chapters provide a clickable official payment-page link. Requires the reader's own, authorized Masiro login session.
 // Does not purchase chapters, bypass login, or fabricate access tokens.
 const mangayomiSources = [{
   name: "真白萌 Masiro（需登入）",
@@ -9,7 +9,7 @@ const mangayomiSources = [{
   iconUrl: "https://masiro.me/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.1.0",
+  version: "0.1.2",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -220,44 +220,155 @@ class DefaultExtension extends MProvider {
     return {name, link:bookUrl, imageUrl, description, author, artist:"", genre, status:5, chapters};
   }
 
-  normalizeImages(html, baseUrl) {
-    const self = this;
-    return String(html || "").replace(/<img\b[^>]*>/gi, tag => {
-      const get = key => {
-        const match=tag.match(new RegExp("(?:\\s|^)"+key+"\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))","i"));
-        return match ? (match[1] || match[2] || match[3] || "") : "";
-      };
-      const image = self.absolute(get("data-src") || get("data-original") || get("src"), baseUrl);
-      if (!image) return "";
-      const alt = get("alt").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
-      return '<img src="'+image.replace(/&/g,"&amp;").replace(/"/g,"&quot;")+'" alt="'+alt+'" />';
+  // Preserve HTML image nodes and their metadata; only repair URL-bearing
+  // attributes. Mangayomi currently hides <img> in online novels, but these
+  // real URLs remain ready for a reader update. Do not turn novels into manga.
+  readerImageUrl(value, pageUrl) {
+    const raw = String(value || "").trim().replace(/&amp;/gi, "&");
+    if (!raw || /^(?:javascript:|blob:|#)/i.test(raw)) return "";
+    if (/^data:image\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith("//")) return "https:" + raw;
+    const baseUrl = String(pageUrl || this.source.baseUrl + "/");
+    const origin = (baseUrl.match(/^https?:\/\/[^/]+/i) || [this.source.baseUrl])[0];
+    const basePath = baseUrl.replace(/^https?:\/\/[^/]+/i, "").split(/[?#]/)[0];
+    const cut = raw.search(/[?#]/);
+    const pathname = cut < 0 ? raw : raw.slice(0, cut);
+    const suffix = cut < 0 ? "" : raw.slice(cut);
+    const rawPath = pathname.startsWith("/") ? pathname
+      : basePath.slice(0, basePath.lastIndexOf("/") + 1) + pathname;
+    const segments = [];
+    for (const segment of rawPath.split("/")) {
+      if (!segment || segment === ".") continue;
+      if (segment === "..") segments.pop();
+      else segments.push(segment);
+    }
+    return origin + "/" + segments.join("/") + suffix;
+  }
+
+  readerImageAttr(tag, key) {
+    const re = new RegExp("(?:^|\\s)" + key + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i");
+    const m = String(tag).match(re);
+    return m ? (m[1] || m[2] || m[3] || "") : "";
+  }
+
+  readerImageSetAttr(tag, key, value) {
+    const safe = String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const re = new RegExp("\\s+" + key + "\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", "i");
+    if (re.test(tag)) return tag.replace(re, ' ' + key + '="' + safe + '"');
+    return tag.replace(/\s*\/?>$/, end => ' ' + key + '="' + safe + '"' + (end.includes("/") ? ' />' : '>'));
+  }
+
+  readerImageSrcset(raw, pageUrl) {
+    return String(raw || "").split(",").map(entry => {
+      const p = entry.trim().match(/^(\S+)(\s+.*)?$/);
+      if (!p) return entry;
+      const url = this.readerImageUrl(p[1], pageUrl);
+      return url ? url + (p[2] || "") : entry;
+    }).join(", ");
+  }
+
+  preserveReaderImages(html, pageUrl) {
+    let output = String(html || "");
+    // Images in noscript are legitimate fallbacks on some novel sites.
+    output = output.replace(/<noscript\b[^>]*>([\s\S]*?)<\/noscript>/gi,
+      (all, inner) => /<(?:img|picture|figure)\b/i.test(inner) ? inner : "");
+    output = output.replace(/<(?:img|source)\b[^>]*>/gi, tag => {
+      // Preserve alt, captions, width, height, class, figure/picture layout,
+      // existing links and data-* attributes. Eliminate executable handlers.
+      let repaired = tag.replace(/\s+on(?:load|error|click)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+      const isImg = /^<img\b/i.test(tag);
+      const originalSet = this.readerImageAttr(repaired, "data-srcset") ||
+        this.readerImageAttr(repaired, "srcset");
+      if (originalSet) {
+        const set = this.readerImageSrcset(originalSet, pageUrl);
+        if (set && !/^data:/i.test(set)) repaired = this.readerImageSetAttr(repaired, "srcset", set);
+      }
+      if (!isImg) return repaired;
+      let src = "";
+      for (const key of ["data-src", "data-original", "data-lazy-src", "data-echo",
+                         "data-url", "data-lazyload", "data-img", "src"]) {
+        const value = this.readerImageAttr(repaired, key).trim();
+        if (!value || /^(?:about:blank|#|javascript:|blob:)/i.test(value)) continue;
+        if (/^data:image\/(?:gif|png);base64,/i.test(value) && value.length < 180) continue;
+        if (/placeholder|loading(?:\.gif|\.png)|blank\.gif|no[-_]?image/i.test(value)) continue;
+        src = value; break;
+      }
+      if (!src && originalSet) src = originalSet.split(",")[0].trim().split(/\s+/)[0];
+      const resolved = this.readerImageUrl(src, pageUrl);
+      if (resolved) repaired = this.readerImageSetAttr(repaired, "src", resolved);
+      // If the source supplied only a placeholder, retain its original tag so
+      // evidence of an unresolved image is not silently deleted.
+      return repaired;
     });
+    return output;
+  }
+
+  normalizeImages(html, chapterUrl) {
+    return this.preserveReaderImages(html, chapterUrl);
   }
   cleanHtml(raw, chapterUrl) {
     let html = String(raw || "");
-    html = html.replace(/<(?:script|style|iframe|noscript)\b[^>]*>[\s\S]*?<\/(?:script|style|iframe|noscript)>/gi, "");
+    html = html.replace(/<(?:script|style|iframe)\b[^>]*>[\s\S]*?<\/(?:script|style|iframe)>/gi, "");
     html = html.replace(/<div\b[^>]*>\s*(?:&nbsp;|\u00a0|\s|<br\s*\/?\s*>)\s*<\/div>/gi, "<p>　</p>");
     html = this.normalizeImages(html, chapterUrl).trim();
     return html;
   }
+  // Mangayomi's novel HTML renderer supports <a href> via onLinkTap.
+  // The link opens the official chapter page. The user personally confirms
+  // the site's real price and purchase; the extension never charges coins.
+  paymentPage(cid, rawCost, reason = "") {
+    const link = this.chapterUrl(cid);
+    const value = Number(rawCost);
+    const costLabel = Number.isFinite(value) && value > 0
+      ? "（網頁顯示 " + value + " 金幣，實際以官網結帳為準）" : "";
+    return [
+      "<h3>前往真白萌官方網站確認章節權限</h3>",
+      "<p>" + (reason || ("此章可能需要購買或解鎖" + costLabel + "。")) + "</p>",
+      '<p><a href="https://masiro.me/admin/auth/login">前往真白萌官方登入頁（帳號／密碼）</a></p>',
+      '<p><a href="' + link + '">開啟真白萌官方章節頁（確認購買）</a></p>',
+      "<p>請在官網登入、核對價格並自行完成付款。購買成功後，返回 Mangayomi 重新整理本章。</p>",
+      "<p>若無法點擊連結，請複製下方網址並使用 Chrome 開啟：</p>",
+      "<p>" + link.replace(/&/g, "&amp;") + "</p>",
+      "<p>本書源不會自動購買、扣除金幣或略過付費限制。</p>"
+    ].join("\n");
+  }
   async getHtmlContent(name, url) {
     const m = String(url || "").match(/[?&]cid=(\d+)/);
     if (!m) throw new Error("Masiro：無效章節網址");
-    const doc = await this.getDocument(this.chapterUrl(m[1]));
-    const paid = this.txt(this.first(doc, [".pay", ".cost-pay", "button.pay"]));
+    let doc;
+    try {
+      doc = await this.getDocument(this.chapterUrl(m[1]));
+    } catch (error) {
+      // A request rejected for login/verification cannot be automatically
+      // purchased. Still provide a direct chapter URL so the reader can
+      // open the official site and authenticate there.
+      if (/需要登入|通過網站驗證|HTTP 401|HTTP 403|HTTP 419/.test(String(error))) {
+        return this.paymentPage(m[1], "", "請先在真白萌官方網站登入或完成驗證，再確認章節購買狀態。");
+      }
+      throw error;
+    }
+    const paid = this.txt(this.first(doc, [".pay", ".cost-pay", "button.pay", ".error-box"]));
     const cost = this.attr(this.first(doc, ["input.cost", ".cost input", "input[name=cost]"]), "value");
     const el = this.first(doc, [".box-body.nvl-content", ".nvl-content"]);
     const content = String(el?.innerHtml || "").trim();
-    const paymentPrompt = /立即打钱|立即打錢|立即支付|付费后阅读|付費後閱讀/.test(paid);
     const contentPlain = content.replace(/<[^>]*>/g, "").trim();
-    const placeholder = /^(?:立即打钱|立即打錢|立即支付)(?:\s*[：:]?\s*\d+\s*(?:金币|金幣))?$/.test(contentPlain);
-    if (paymentPrompt || placeholder || (!content && cost && Number(cost) > 0))
-      throw new Error("Masiro：這是付費章節；請先用自己的帳號在真白萌官網合法購買，然後重新整理");
+    const paymentWords = /立即打钱|立即打錢|立即支付|立即付款|付费后阅读|付費後閱讀|未购买|未購買|尚未購買|尚未解鎖/;
+    const paymentPrompt = paymentWords.test(paid);
+    const placeholder = /^(?:立即打钱|立即打錢|立即支付|立即付款)(?:\s*[：:]?\s*\d+\s*(?:金币|金幣|G))?$/i.test(contentPlain);
+    const lockedText = /(?:本章|此章|本章节|该章节).{0,35}(?:未购买|未購買|尚未解鎖|付费|付費|金币不足|金幣不足)/i.test(contentPlain);
+    const readable = contentPlain.length >= 100 || /<img\b/i.test(content);
+    // Cost is metadata, not proof that a user has not already purchased.
+    // A previously purchased chapter should render its actual content.
+    // A locked chapter is a valid reading state, not an extension error.
+    // Its HTML presents a safe manual link to the official payment page.
+    if ((!readable && (paymentPrompt || placeholder || lockedText)) || (!content && cost && Number(cost) > 0))
+      return this.paymentPage(m[1], cost);
     if (!el || !content) {
       const empty = this.txt(this.first(doc,[".error-box",".box-body",".content"]));
       if (/小孩子不能看|等级不足|等級不足/.test(empty)) throw new Error("Masiro：帳號閱讀等級不足");
       if (/当前章节内容为空|當前章節內容為空/.test(empty)) throw new Error("Masiro：網站回傳空章節");
-      throw new Error("Masiro：找不到正文；可能需要登入、購買章節或網站已修改介面");
+      return this.paymentPage(m[1], cost, "本章目前未取得可閱讀正文；請在官網確認是否需要登入、購買或具有閱讀權限。");
     }
     const html = this.cleanHtml(content, url);
     if (!html || (!/<img\b/i.test(html) && !html.replace(/<[^>]*>/g,"").replace(/&nbsp;|\s/g, "").trim()))

@@ -10,16 +10,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js?v=0.3.2",
     "apiUrl": "",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.3.1: send HTTP request headers, recognize validation pages, browser fallback for site verification (no challenge bypass); keep multipart chapters"
+    "notes": "Image-HTML preservation; retain original chapter IDs and URLs. No reader-app image-renderer change."
   },
   {
     "name": "嗶哩輕小說（繁體）",
@@ -32,16 +32,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.12",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.13",
     "apiUrl": "",
-    "version": "0.2.12",
+    "version": "0.2.13",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.12: fix 詭/诡 title normalization, expand bounded public title matching (10 latest + 5 popular pages), show No result instead of exception when sampled catalogues have no title matches; not full-site search; preserve existing book/chapter URLs and reader logic"
+    "notes": "Image-HTML preservation; retain original chapter IDs and URLs. No reader-app image-renderer change."
   },
   {
     "name": "真白萌 Masiro（需登入）",
@@ -54,15 +54,15 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/masiro.js?v=0.1.0",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/masiro.js?v=0.1.2",
     "apiUrl": "",
-    "version": "0.1.0",
+    "version": "0.1.2",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.1.0 beta: Masiro lists/search via loadMoreNovels JSON, catalog via embedded scripts, authenticated chapters only. Login/paid access must be completed on official website; no automatic purchase or challenge bypass."
+    "notes": "Image-HTML preservation; retain original chapter IDs and URLs. Official paid-chapter page link; no automatic purchase."
   }
 ]

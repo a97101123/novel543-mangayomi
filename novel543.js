@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://www.novel543.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.1",
+  version: "0.3.2",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -212,14 +212,100 @@ class DefaultExtension extends MProvider {
     if (chapters.length === 0) throw new Error("Novel543：找不到章節目錄");
     return { name, link: url, imageUrl, description, author, artist: "", genre, status: 5, chapters: this.normalizeChapters(chapters) };
   }
-  cleanHtml(html) {
+  // Preserve HTML image nodes and their metadata; only repair URL-bearing
+  // attributes. Mangayomi currently hides <img> in online novels, but these
+  // real URLs remain ready for a reader update. Do not turn novels into manga.
+  readerImageUrl(value, pageUrl) {
+    const raw = String(value || "").trim().replace(/&amp;/gi, "&");
+    if (!raw || /^(?:javascript:|blob:|#)/i.test(raw)) return "";
+    if (/^data:image\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith("//")) return "https:" + raw;
+    const baseUrl = String(pageUrl || this.source.baseUrl + "/");
+    const origin = (baseUrl.match(/^https?:\/\/[^/]+/i) || [this.source.baseUrl])[0];
+    const basePath = baseUrl.replace(/^https?:\/\/[^/]+/i, "").split(/[?#]/)[0];
+    const cut = raw.search(/[?#]/);
+    const pathname = cut < 0 ? raw : raw.slice(0, cut);
+    const suffix = cut < 0 ? "" : raw.slice(cut);
+    const rawPath = pathname.startsWith("/") ? pathname
+      : basePath.slice(0, basePath.lastIndexOf("/") + 1) + pathname;
+    const segments = [];
+    for (const segment of rawPath.split("/")) {
+      if (!segment || segment === ".") continue;
+      if (segment === "..") segments.pop();
+      else segments.push(segment);
+    }
+    return origin + "/" + segments.join("/") + suffix;
+  }
+
+  readerImageAttr(tag, key) {
+    const re = new RegExp("(?:^|\\s)" + key + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i");
+    const m = String(tag).match(re);
+    return m ? (m[1] || m[2] || m[3] || "") : "";
+  }
+
+  readerImageSetAttr(tag, key, value) {
+    const safe = String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const re = new RegExp("\\s+" + key + "\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", "i");
+    if (re.test(tag)) return tag.replace(re, ' ' + key + '="' + safe + '"');
+    return tag.replace(/\s*\/?>$/, end => ' ' + key + '="' + safe + '"' + (end.includes("/") ? ' />' : '>'));
+  }
+
+  readerImageSrcset(raw, pageUrl) {
+    return String(raw || "").split(",").map(entry => {
+      const p = entry.trim().match(/^(\S+)(\s+.*)?$/);
+      if (!p) return entry;
+      const url = this.readerImageUrl(p[1], pageUrl);
+      return url ? url + (p[2] || "") : entry;
+    }).join(", ");
+  }
+
+  preserveReaderImages(html, pageUrl) {
+    let output = String(html || "");
+    // Images in noscript are legitimate fallbacks on some novel sites.
+    output = output.replace(/<noscript\b[^>]*>([\s\S]*?)<\/noscript>/gi,
+      (all, inner) => /<(?:img|picture|figure)\b/i.test(inner) ? inner : "");
+    output = output.replace(/<(?:img|source)\b[^>]*>/gi, tag => {
+      // Preserve alt, captions, width, height, class, figure/picture layout,
+      // existing links and data-* attributes. Eliminate executable handlers.
+      let repaired = tag.replace(/\s+on(?:load|error|click)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+      const isImg = /^<img\b/i.test(tag);
+      const originalSet = this.readerImageAttr(repaired, "data-srcset") ||
+        this.readerImageAttr(repaired, "srcset");
+      if (originalSet) {
+        const set = this.readerImageSrcset(originalSet, pageUrl);
+        if (set && !/^data:/i.test(set)) repaired = this.readerImageSetAttr(repaired, "srcset", set);
+      }
+      if (!isImg) return repaired;
+      let src = "";
+      for (const key of ["data-src", "data-original", "data-lazy-src", "data-echo",
+                         "data-url", "data-lazyload", "data-img", "src"]) {
+        const value = this.readerImageAttr(repaired, key).trim();
+        if (!value || /^(?:about:blank|#|javascript:|blob:)/i.test(value)) continue;
+        if (/^data:image\/(?:gif|png);base64,/i.test(value) && value.length < 180) continue;
+        if (/placeholder|loading(?:\.gif|\.png)|blank\.gif|no[-_]?image/i.test(value)) continue;
+        src = value; break;
+      }
+      if (!src && originalSet) src = originalSet.split(",")[0].trim().split(/\s+/)[0];
+      const resolved = this.readerImageUrl(src, pageUrl);
+      if (resolved) repaired = this.readerImageSetAttr(repaired, "src", resolved);
+      // If the source supplied only a placeholder, retain its original tag so
+      // evidence of an unresolved image is not silently deleted.
+      return repaired;
+    });
+    return output;
+  }
+
+  cleanHtml(html, pageUrl) {
     let result = String(html || "");
     result = result.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
     result = result.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
     result = result.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, "");
-    result = result.replace(/溫馨提示[：:][\s\S]*$/i, "");
+    // Only remove standalone site notices; never discard everything after
+    // a warning phrase, since the following paragraphs can contain images.
+    result = result.replace(/<(p|div|small)\b[^>]*>\s*溫馨提示[：:][\s\S]{0,160}?<\/\1>/gi, "");
     result = result.replace(/<a\b[^>]*>\s*(上一章|下一章|目錄|回到頂部)\s*<\/a>/gi, "");
-    return result.trim();
+    return this.preserveReaderImages(result, pageUrl).trim();
   }
   getPageInfo(doc) {
     const titleEl = this.first(doc, ["h1", ".chapter-title", "title"]);
@@ -227,10 +313,10 @@ class DefaultExtension extends MProvider {
     const match = title.match(/[（(]\s*(\d+)\s*\/\s*(\d+)\s*[)）]/);
     return match ? {current: Number(match[1]), total: Number(match[2])} : {current:1,total:1};
   }
-  getContent(doc) {
+  getContent(doc, pageUrl) {
     const content = this.first(doc, [".chapter-content", ".content", "#chapter-content", "#content", ".read-content"]);
     if (!content) throw new Error("Novel543：找不到正文元素");
-    const html = this.cleanHtml(content.innerHtml || "");
+    const html = this.cleanHtml(content.innerHtml || "", pageUrl);
     if (!html) throw new Error("Novel543：正文為空");
     return html;
   }
@@ -242,7 +328,7 @@ class DefaultExtension extends MProvider {
   async getHtmlContent(name, url) {
     const doc = await this.load(url);
     const pageInfo = this.getPageInfo(doc);
-    let html = this.getContent(doc);
+    let html = this.getContent(doc, url);
     if (pageInfo.total <= 1) return html;
     if (pageInfo.total > 10) throw new Error("Novel543：章節分頁數量異常");
     if (pageInfo.current !== 1) return html;
@@ -252,7 +338,7 @@ class DefaultExtension extends MProvider {
       const nextDoc = await this.load(nextUrl);
       const nextInfo = this.getPageInfo(nextDoc);
       if (nextInfo.current !== page || nextInfo.total !== pageInfo.total) throw new Error("Novel543：分頁內容不符合預期");
-      html += "<hr/>" + this.getContent(nextDoc);
+      html += "<hr/>" + this.getContent(nextDoc, nextUrl);
     }
     return html;
   }
