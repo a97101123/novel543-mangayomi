@@ -10,16 +10,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js?v=0.3.2",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js?v=0.3.3",
     "apiUrl": "",
-    "version": "0.3.2",
+    "version": "0.3.3",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "Image-HTML preservation; retain original chapter IDs and URLs. No reader-app image-renderer change."
+    "notes": "v0.3.3: validate real chapter parts up to 64 pages, accept missing page-count labels but reject wrong/duplicate/missing pages; preserve original URLs and images."
   },
   {
     "name": "嗶哩輕小說（繁體）",

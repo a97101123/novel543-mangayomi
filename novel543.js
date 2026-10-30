@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://www.novel543.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.2",
+  version: "0.3.3",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -81,15 +81,18 @@ class DefaultExtension extends MProvider {
     let response, failure;
     try {
       response = await new Client().get(url, this.getHeaders(url));
-      const code = Number(response?.statusCode || response?.status || 200);
-      if (response?.body && !this.isVerificationPage(response.body, code)) {
+    } catch (err) { failure = err; }
+    if (response) {
+      const code = Number(response?.statusCode ?? response?.status ?? 200);
+      if (code === 429) throw new Error("Novel543：網站限制請求頻率（HTTP 429），請稍後重試");
+      if (code === 404 || code === 410)
+        throw new Error("Novel543：分頁不存在（HTTP " + code + "）：" + url);
+      if (code >= 400 && !this.isVerificationPage(response.body, code))
+        throw new Error("Novel543：網站回應 HTTP " + code + "：" + url);
+      if (response.body && !this.isVerificationPage(response.body, code))
         return new Document(response.body);
-      }
-    } catch (err) {
-      failure = err;
     }
-    // A single fallback only. Opening the page in a real browser still may
-    // require user interaction; no synthetic challenge tokens are generated.
+    // Only one browser fallback for access verification; not 404 or 429.
     try { return await this.loadViaBrowser(url); }
     catch (err) {
       const cause = failure ? "；原始網路錯誤：" + String(failure) : "";
@@ -307,40 +310,95 @@ class DefaultExtension extends MProvider {
     result = result.replace(/<a\b[^>]*>\s*(上一章|下一章|目錄|回到頂部)\s*<\/a>/gi, "");
     return this.preserveReaderImages(result, pageUrl).trim();
   }
+  // A page marker can be in H1, chapter heading or the document title.
+  // Missing marker is UNKNOWN, not evidence that the page is "1/1".
   getPageInfo(doc) {
-    const titleEl = this.first(doc, ["h1", ".chapter-title", "title"]);
-    const title = titleEl?.text || "";
-    const match = title.match(/[（(]\s*(\d+)\s*\/\s*(\d+)\s*[)）]/);
-    return match ? {current: Number(match[1]), total: Number(match[2])} : {current:1,total:1};
-  }
-  getContent(doc, pageUrl) {
-    const content = this.first(doc, [".chapter-content", ".content", "#chapter-content", "#content", ".read-content"]);
-    if (!content) throw new Error("Novel543：找不到正文元素");
-    const html = this.cleanHtml(content.innerHtml || "", pageUrl);
-    if (!html) throw new Error("Novel543：正文為空");
-    return html;
-  }
-  getSubPageUrl(url, page) {
-    const clean = url.split("?")[0];
-    const match = clean.match(/^(.*\/\d+_[^/]+?)(?:_(\d+))?\.html$/);
-    return match ? match[1] + "_" + page + ".html" : "";
-  }
-  async getHtmlContent(name, url) {
-    const doc = await this.load(url);
-    const pageInfo = this.getPageInfo(doc);
-    let html = this.getContent(doc, url);
-    if (pageInfo.total <= 1) return html;
-    if (pageInfo.total > 10) throw new Error("Novel543：章節分頁數量異常");
-    if (pageInfo.current !== 1) return html;
-    for (let page = 2; page <= pageInfo.total; page++) {
-      const nextUrl = this.getSubPageUrl(url, page);
-      if (!nextUrl) throw new Error("Novel543：無法建立分頁網址");
-      const nextDoc = await this.load(nextUrl);
-      const nextInfo = this.getPageInfo(nextDoc);
-      if (nextInfo.current !== page || nextInfo.total !== pageInfo.total) throw new Error("Novel543：分頁內容不符合預期");
-      html += "<hr/>" + this.getContent(nextDoc, nextUrl);
+    for (const selector of [".chapter-title", ".read-title", ".chapter_title", "h1", "title"]) {
+      for (const el of doc.select(selector)) {
+        const title = String(el?.text || "");
+        const pattern = /[（(]\s*(\d+)\s*[/／]\s*(\d+)\s*[)）]/g;
+        let match, last = null;
+        while ((match = pattern.exec(title)) !== null) last = match;
+        if (!last) continue;
+        const current = Number(last[1]), total = Number(last[2]);
+        if (current >= 1 && total >= current) return {current, total, explicit:true};
+      }
     }
+    return {current:null, total:null, explicit:false};
+  }
+
+  getContent(doc, pageUrl) {
+    const content = this.first(doc, [".chapter-content", "#chapter-content", "#content", ".read-content", ".content"]);
+    if (!content) throw new Error("Novel543：找不到正文元素：" + pageUrl);
+    const html = this.cleanHtml(content.innerHtml || "", pageUrl);
+    if (!html || (!/<img\b/i.test(html) &&
+        !html.replace(/<[^>]*>/g, "").replace(/&nbsp;|\s/g, "").trim()))
+      throw new Error("Novel543：分頁正文為空：" + pageUrl);
     return html;
+  }
+
+  getSubPageUrl(url, page) {
+    const clean = String(url || "").split(/[?#]/)[0];
+    // Standard: /BOOK_ID/8096_CHAPTER_ID.html and ..._2.html.
+    const match = clean.match(/^(https?:\/\/[^/]+\/\d+\/\d+_\d+)(?:_(\d+))?\.html$/i);
+    return match && page >= 2 ? match[1] + "_" + page + ".html" : "";
+  }
+
+  pageSignature(html) {
+    // Only for duplicate detection; it never removes any actual prose.
+    return String(html || "").replace(/<[^>]+>/g, "").replace(/&nbsp;|&#160;/gi, " ")
+      .replace(/\s+/g, "").trim().slice(0, 1600);
+  }
+
+  async getHtmlContent(name, url) {
+    const firstDoc = await this.load(url);
+    const info = this.getPageInfo(firstDoc);
+    const firstPage = this.getContent(firstDoc, url);
+    if (!info.explicit || info.total <= 1) return firstPage;
+    if (info.current !== 1)
+      throw new Error("Novel543：目錄入口不是章節第一頁，請重新整理目錄：" + url);
+
+    const MAX_PAGES = 64;
+    let total = info.total;
+    if (total > MAX_PAGES)
+      throw new Error("Novel543：網站顯示 " + total + " 頁，超出 " + MAX_PAGES + " 頁安全上限");
+    const parts = [firstPage];
+    const signatures = new Set([this.pageSignature(firstPage)]);
+
+    for (let page = 2; page <= total; page++) {
+      const nextUrl = this.getSubPageUrl(url, page);
+      if (!nextUrl)
+        throw new Error("Novel543：無法組成第 " + page + " 頁網址，請回報章節網址");
+      let nextDoc;
+      try { nextDoc = await this.load(nextUrl); }
+      catch (error) {
+        throw new Error("Novel543：第 " + page + "/" + total + " 頁讀取失敗（" +
+          String(error) + "）。為避免漏頁，不回傳不完整正文");
+      }
+
+      const pageInfo = this.getPageInfo(nextDoc);
+      // Only reject genuinely contradictory labels. A missing (2/2)
+      // indicator is not itself an error if the page and content are valid.
+      if (pageInfo.explicit && pageInfo.current !== page)
+        throw new Error("Novel543：第 " + page + " 頁的標記實際是 " +
+          pageInfo.current + "/" + pageInfo.total + "，已停止避免混入錯誤內容");
+
+      const html = this.getContent(nextDoc, nextUrl);
+      const signature = this.pageSignature(html);
+      if (signature && signatures.has(signature))
+        throw new Error("Novel543：第 " + page + " 頁和先前內容重複，網站可能回傳錯誤分頁");
+      if (signature) signatures.add(signature);
+      parts.push(html);
+
+      // An updated page can reveal additional parts. Never silently
+      // truncate a previously advertised part when the count changes.
+      if (pageInfo.explicit && pageInfo.total > total) {
+        total = pageInfo.total;
+        if (total > MAX_PAGES)
+          throw new Error("Novel543：分頁數已增加至 " + total + "，超出安全上限");
+      }
+    }
+    return parts.join("\n<hr/>\n");
   }
   getFilterList() { return []; }
   getSourcePreferences() { return []; }
