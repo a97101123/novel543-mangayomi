@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.13",
+  version: "0.2.14",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -22,12 +22,36 @@ class DefaultExtension extends MProvider {
     };
   }
 
+  // Adapted reliability pattern: retry one transient network/server error,
+  // never retry a 403 challenge or a 429 rate-limit response automatically.
   async load(url) {
-    const response = await new Client().get(url, this.getHeaders(url));
-    if (!response || !response.body) {
-      throw new Error("Linovelib：網頁沒有回傳 HTML");
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let response;
+      try {
+        response = await new Client().get(url, this.getHeaders(url));
+      } catch (error) {
+        lastError = error;
+        if (attempt === 0) continue;
+        throw new Error("Linovelib：連線失敗（" + String(error) + "）");
+      }
+      const status = Number(response?.statusCode ?? response?.status ?? 200);
+      if ([502, 503, 504].includes(status) && attempt === 0) continue;
+      if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試");
+      if ([401, 403].includes(status)) throw new Error("Linovelib：網站要求驗證或拒絕存取（HTTP " + status + "）");
+      if (status >= 400) throw new Error("Linovelib：網站回應 HTTP " + status);
+      const html = String(response?.body || "");
+      if (!html.trim()) {
+        if (attempt === 0) continue;
+        throw new Error("Linovelib：網頁沒有回傳 HTML");
+      }
+      // A successful HTTP status does not guarantee a readable document.
+      if (/cf-challenge|challenge-platform|<title[^>]*>\s*(?:Just a moment|Checking your browser)/i.test(html.slice(0,4000))) {
+        throw new Error("Linovelib：取得網站驗證頁，而非所需的小說資料");
+      }
+      return new Document(html);
     }
-    return new Document(response.body);
+    throw new Error("Linovelib：請求暫時失敗（" + String(lastError || "no_response") + "）");
   }
 
   absolute(href, context) {
@@ -536,7 +560,7 @@ class DefaultExtension extends MProvider {
     // The extension notes explain that coverage is not all-site search.
     if(publicResult.status==="fulfilled" && publicResult.value.reachablePages>0) return this.blank();
     // No search source worked: do NOT falsely report that the book is absent.
-    throw new Error("Linovelib v0.2.12：搜尋來源無法存取，無法判定書名是否存在。" +
+    throw new Error("Linovelib v0.2.14：搜尋來源無法存取，無法判定書名是否存在。" +
       "可改用書籍 ID 查詢；網站完整搜尋須有正常核發的搜尋票證。" +
       (publicResult.status==="rejected" ? " 公開書庫："+String(publicResult.reason) : "") +
       (cseResult.status==="rejected" ? " CSE："+String(cseResult.reason) : ""));
@@ -1010,6 +1034,15 @@ class DefaultExtension extends MProvider {
           // ~1.5s of stable content, not the old ~2.4s plus HTTP fallback.
           if (stableCount >= 3 && Date.now() - start >= 1100) {
             var next = (window.ReadParams && window.ReadParams.url_next) || "";
+            // The scraper's pagination strategy also reads script-defined
+            // ReadParams. This is a fallback if window.ReadParams is absent.
+            if (!next) {
+              var scripts = document.querySelectorAll("script");
+              for (var n = 0; n < scripts.length; n++) {
+                var found = String(scripts[n].textContent || "").match(/\burl_next\s*:\s*['"]([^'"]+\.html)['"]/i);
+                if (found) { next = found[1]; break; }
+              }
+            }
             report({ html: html, next: next, title: (document.querySelector("#atitle") || {}).textContent || "", error: "" });
             return;
           }

@@ -1,5 +1,5 @@
 // Mangayomi JavaScript novel source — independently implemented for Masiro.
-// v0.1.2 beta. Paid chapters provide a clickable official payment-page link. Requires the reader's own, authorized Masiro login session.
+// v0.1.4 beta. Reader theme/contrast normalization; original media HTML is preserved. Paid chapters provide a clickable official payment-page link. Requires the reader's own, authorized Masiro login session.
 // Does not purchase chapters, bypass login, or fabricate access tokens.
 const mangayomiSources = [{
   name: "真白萌 Masiro（需登入）",
@@ -9,7 +9,7 @@ const mangayomiSources = [{
   iconUrl: "https://masiro.me/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.1.2",
+  version: "0.1.4",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -59,19 +59,31 @@ class DefaultExtension extends MProvider {
     const hasSignIn = /(?:admin\/auth\/login|action\s*=\s*["'][^"']*login|<title[^>]*>[^<]*(?:登入|登录|sign\s*in|log\s*in))/i.test(s);
     return hasPassword && hasSignIn;
   }
+  // Preserve the user's authorized session. Retry only one transient
+  // network/502-504 failure; NEVER replay login or payment POST requests.
   async request(url) {
-    let response;
-    try { response = await new Client().get(url, this.getHeaders(url)); }
-    catch (e) { throw new Error("Masiro：連線失敗（" + String(e) + "）"); }
-    const status = Number(response?.statusCode ?? response?.status ?? 200);
-    const html = String(response?.body || "");
-    if (status === 401 || status === 403 || status === 419 || this.isLoginPage(html)) {
-      throw new Error("Masiro：需要登入或通過網站驗證。請在 Mangayomi WebView 登入 https://masiro.me/admin/auth/login 後重試（HTTP " + status + "）");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let response;
+      try { response = await new Client().get(url, this.getHeaders(url)); }
+      catch (error) {
+        if (attempt === 0) continue;
+        throw new Error("Masiro：連線失敗（" + String(error) + "）");
+      }
+      const status = Number(response?.statusCode ?? response?.status ?? 200);
+      const html = String(response?.body || "");
+      if (status === 401 || status === 403 || status === 419 || this.isLoginPage(html)) {
+        throw new Error("Masiro：需要登入或通過網站驗證。請在 Mangayomi WebView 登入 https://masiro.me/admin/auth/login 後重試（HTTP " + status + "）");
+      }
+      if (status === 429) throw new Error("Masiro：網站限制請求頻率，請稍後重試，避免連續大量預下載");
+      if ([502, 503, 504].includes(status) && attempt === 0) continue;
+      if (status >= 400) throw new Error("Masiro：網站回應 HTTP " + status);
+      if (!html.trim()) {
+        if (attempt === 0) continue;
+        throw new Error("Masiro：網站沒有回傳資料");
+      }
+      return html;
     }
-    if (status === 429) throw new Error("Masiro：網站限制請求頻率，請稍後重試，避免連續大量預下載");
-    if (status >= 400) throw new Error("Masiro：網站回應 HTTP " + status);
-    if (!html.trim()) throw new Error("Masiro：網站沒有回傳資料");
-    return html;
+    throw new Error("Masiro：網站暫時無法讀取");
   }
   async getDocument(url) { return new Document(await this.request(url)); }
   async requestJson(url) {
@@ -307,10 +319,42 @@ class DefaultExtension extends MProvider {
   normalizeImages(html, chapterUrl) {
     return this.preserveReaderImages(html, chapterUrl);
   }
+
+  // Website-authored text often specifies black lettering / a white panel.
+  // flutter_html gives those inline attributes precedence over the user's
+  // dark reader theme, resulting in black-on-dark text. Strip ONLY the
+  // conflicting presentation attributes, retaining semantic text markup,
+  // figures, images, their own styles, and clickable chapter-payment links.
+  normalizeReaderTextStyles(html) {
+    const blockedCss = /^(?:color|background(?:-.*)?|-webkit-text-(?:fill|stroke)(?:-color)?|font(?:-family|-size|-stretch|-variant)?|line-height|letter-spacing|word-spacing|margin(?:-.*)?|padding(?:-.*)?|text-indent|(?:min-|max-)?(?:width|height)|filter|-webkit-filter|mix-blend-mode|box-shadow|text-shadow)$/i;
+    return String(html || "").replace(/<([a-z][a-z0-9:-]*)\b[^>]*>/gi, (tag, name) => {
+      // Original media presentation belongs to the media, not to body text.
+      if (/^(?:img|source|picture|video|audio|svg|path|canvas)$/i.test(name)) return tag;
+      let result = tag.replace(/\s+(?:bgcolor|background|color|face)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+      result = result.replace(/\s+style\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,
+        (matched, quoted, single, bare) => {
+          const style = String(quoted ?? single ?? bare ?? "");
+          const safe = style.split(";").map(v => v.trim()).filter(v => {
+            const separator = v.indexOf(":");
+            if (separator < 1) return false;
+            const property = v.slice(0, separator).trim();
+            return !blockedCss.test(property);
+          });
+          if (!safe.length) return "";
+          const value = safe.join("; ").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+          return ' style="' + value + '"';
+        });
+      return result;
+    });
+  }
+
   cleanHtml(raw, chapterUrl) {
     let html = String(raw || "");
     html = html.replace(/<(?:script|style|iframe)\b[^>]*>[\s\S]*?<\/(?:script|style|iframe)>/gi, "");
-    html = html.replace(/<div\b[^>]*>\s*(?:&nbsp;|\u00a0|\s|<br\s*\/?\s*>)\s*<\/div>/gi, "<p>　</p>");
+    // Do not convert blank DIVs into additional visible paragraphs. A true
+    // scene break or a BR already in the source remains untouched.
+    html = html.replace(/<div\b[^>]*>\s*(?:&nbsp;|&#160;|\u00a0|\s|<br\s*\/?\s*>)\s*<\/div>/gi, "");
+    html = this.normalizeReaderTextStyles(html);
     html = this.normalizeImages(html, chapterUrl).trim();
     return html;
   }
@@ -354,7 +398,10 @@ class DefaultExtension extends MProvider {
     const content = String(el?.innerHtml || "").trim();
     const contentPlain = content.replace(/<[^>]*>/g, "").trim();
     const paymentWords = /立即打钱|立即打錢|立即支付|立即付款|付费后阅读|付費後閱讀|未购买|未購買|尚未購買|尚未解鎖/;
-    const paymentPrompt = paymentWords.test(paid);
+    // The Masiro downloader identifies a locked chapter from the full
+    // site's payment prompt, which may not be inside .nvl-content itself.
+    const entirePage = this.txt(this.first(doc, ["body"]));
+    const paymentPrompt = paymentWords.test(paid) || /立即打钱|立即打錢|立即支付|立即付款/.test(entirePage);
     const placeholder = /^(?:立即打钱|立即打錢|立即支付|立即付款)(?:\s*[：:]?\s*\d+\s*(?:金币|金幣|G))?$/i.test(contentPlain);
     const lockedText = /(?:本章|此章|本章节|该章节).{0,35}(?:未购买|未購買|尚未解鎖|付费|付費|金币不足|金幣不足)/i.test(contentPlain);
     const readable = contentPlain.length >= 100 || /<img\b/i.test(content);
