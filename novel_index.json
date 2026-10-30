@@ -32,15 +32,15 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.10",
     "apiUrl": "",
-    "version": "0.2.9",
+    "version": "0.2.10",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.9: direct book-ID search with HTTP and headless WebView fallback; guarded keyword search on bilinovel host with only site-issued session cookies; preserve catalog and reading behavior"
+    "notes": "v0.2.10: restore deterministic paragraph order, remove hidden decoy nodes and exact long duplicates, use public tag catalogue for 轉生 when site keyword ticket is unavailable; keep novel543 unchanged"
   }
 ]

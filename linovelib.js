@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.9",
+  version: "0.2.10",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -349,6 +349,47 @@ class DefaultExtension extends MProvider {
     }));
   }
 
+  // Public catalogue by verified tag. This is a category browse, not the
+  // site's protected full-text search, so it does not claim to find every
+  // title/author matching the supplied word.
+  async searchPublicCategory(word, page) {
+    const tag = String(word || "").trim();
+    const genreId = /^(轉生|转生)$/.test(tag) ? 26 : 0;
+    if (!genreId || page < 1) return null;
+    const url = this.source.baseUrl + "/wenku/lastupdate_" + genreId + "_0_0_0_0_0_0_" + page + "_0.html";
+    const doc = await this.load(url);
+    const list = this.listFromPage(doc, url, false);
+    if (!list.length) throw new Error("Linovelib：公開分類頁未回傳作品");
+    return { list, hasNextPage: list.length >= 20 };
+  }
+
+  // Limited fallback: only match titles visible on public popularity/update
+  // pages. Never imply that an absent result means the entire site lacks it.
+  async searchPublicListings(word) {
+    const base = this.source.baseUrl;
+    const paths = [
+      "/wenku/lastupdate_0_0_0_0_0_0_0_1_0.html",
+      "/wenku/lastupdate_0_0_0_0_0_0_0_2_0.html",
+      "/wenku/allvisit_0_0_0_0_0_0_0_1_0.html"
+    ];
+    const found = [], seen = new Set();
+    const normalized = String(word || "").toLowerCase().replace(/\s+/g, "");
+    const pages = await Promise.allSettled(paths.map(async p => {
+      const url = base + p;
+      return this.listFromPage(await this.load(url), url, false);
+    }));
+    for (const page of pages) {
+      if (page.status !== "fulfilled") continue;
+      for (const item of page.value.list) {
+        const label = String(item.name || "").toLowerCase().replace(/\s+/g, "");
+        if (!label.includes(normalized) || seen.has(item.link)) continue;
+        seen.add(item.link);
+        found.push(item);
+      }
+    }
+    return found;
+  }
+
   async search(query, page, filters) {
     const word = String(query ?? "").trim();
     if (!word || page < 1) return this.blank();
@@ -356,8 +397,10 @@ class DefaultExtension extends MProvider {
     if (id) {
       return page > 1 ? this.blank() : { list: await this.searchByBookId(id), hasNextPage: false };
     }
-    // For the first iteration, the guarded search session only guarantees a
-    // single page. Returning false avoids a misleading infinite page spinner.
+    // Prefer the site's public category page for a recognized genre term.
+    // Do not spend time requesting a ticket that the server currently refuses.
+    const category = await this.searchPublicCategory(word, page).catch(() => null);
+    if (category) return category;
     if (page > 1) return this.blank();
     let httpError;
     try {
@@ -371,7 +414,11 @@ class DefaultExtension extends MProvider {
       const list = await this.searchViaBrowser(url, word);
       return { list, hasNextPage: false };
     } catch (error) {
-      throw new Error("Linovelib v0.2.9：搜尋未完成。網站搜尋流程：" + String(httpError || "無結果") + "；背景瀏覽器：" + String(error) + "。書籍 ID 可直接搜尋，網站驗證需由使用者正常完成。");
+      const fallback = await this.searchPublicListings(word).catch(() => []);
+      if (fallback.length) return { list: fallback, hasNextPage: false };
+      throw new Error("Linovelib v0.2.10：網站完整搜尋未通過驗證；公開書庫也沒有找到符合標題的作品。" +
+        "書籍 ID 可直接查詢；一般名稱搜尋需網站正常核發票證。" +
+        "網站搜尋：" + String(httpError || "無結果") + "；背景瀏覽器：" + String(error));
     }
   }
 
@@ -582,6 +629,21 @@ class DefaultExtension extends MProvider {
       if (/^[〖【]?手機版頁面由於相容性問題暫不支持電腦端閱讀[，,]?請使用手機閱讀[。！!]?[〗】]?$/.test(text)) return "";
       return all;
     });
+    // A site obfuscation layer can duplicate entire long paragraphs. Remove
+    // *exact* second occurrences only (not similar text or short refrains).
+    // Never deduplicate image-containing paragraphs.
+    if (!/(?:插圖|插画|彩圖|彩图|彩頁|彩页)/.test(chapterTitle)) {
+      const repeated = new Set();
+      s = s.replace(/<p\b[^>]*>[\s\S]*?<\/p>/gi, p => {
+        if (/<img\b/i.test(p)) return p;
+        const key = p.replace(/<[^>]+>/g, "").replace(/&nbsp;|&#160;/gi, " ")
+          .replace(/\s+/g, "").trim();
+        if (key.length < 65) return p;
+        if (repeated.has(key)) return "";
+        repeated.add(key);
+        return p;
+      });
+    }
     // Some illustration pages repeat long publishing-credit paragraphs.
     // Limit this to illustration chapters to avoid deleting repeated prose.
     if (/(?:插圖|插画|彩圖|彩图|彩頁|彩页)/.test(chapterTitle)) {
@@ -662,8 +724,8 @@ class DefaultExtension extends MProvider {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
     const script = String.raw`(function () {
-      if (window.__linovelibCaptureV023) return;
-      window.__linovelibCaptureV023 = true;
+      if (window.__linovelibCaptureV0210) return;
+      window.__linovelibCaptureV0210 = true;
       var finished = false;
       var start = Date.now();
       var signature = "";
@@ -680,14 +742,50 @@ class DefaultExtension extends MProvider {
         return !!value && !/^(?:data:|blob:|javascript:|#)/i.test(value) &&
           !/placeholder|loading|blank|no[-_]?image/i.test(value);
       }
+      // Reverse the site's deterministic permutation of content paragraphs.
+      // Only direct non-empty <p> children participate. Other elements,
+      // including images, remain at their original positions.
+      function restoreParagraphOrder(root) {
+        var match = location.pathname.match(/\/novel\/\d+\/(\d+)(?:_\d+)?\.html$/);
+        if (!match) return;
+        var chapterId = Number(match[1]);
+        if (!Number.isSafeInteger(chapterId)) return;
+        var children = Array.prototype.slice.call(root.children);
+        var paragraphs = children.filter(function(node) {
+          return node.tagName && node.tagName.toLowerCase() === "p" &&
+            String(node.innerHTML || "").replace(/\s+/g, "").length > 0;
+        });
+        if (paragraphs.length <= 20) return;
+        var perm = paragraphs.map(function(_, i) { return i; });
+        var seed = chapterId * 126 + 232;
+        for (var i = perm.length - 1; i > 20; i--) {
+          seed = (seed * 9302 + 49397) % 233280;
+          var j = 20 + Math.floor(seed / 233280 * (i - 20 + 1));
+          var tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+        }
+        var restored = paragraphs.slice();
+        for (var raw = 0; raw < paragraphs.length; raw++) {
+          restored[perm[raw]] = paragraphs[raw];
+        }
+        // Clone replacement nodes before DOM mutation, avoiding accidental
+        // movement of a paragraph needed by a subsequent replacement.
+        var copies = restored.map(function(node) { return node.cloneNode(true); });
+        for (var k = 0; k < paragraphs.length; k++) {
+          paragraphs[k].parentNode.replaceChild(copies[k], paragraphs[k]);
+        }
+      }
       // Copy browser-resolved lazy image URLs into real src attributes.
       function snapshot(el) {
         var clone = el.cloneNode(true);
-        var originalImgs = el.querySelectorAll("img");
+        // Remove explicitly hidden site-injected decoys before counting and
+        // reordering paragraphs. Do not delete generic center/image nodes.
+        var junk = clone.querySelectorAll(".cgo, script, style, ins");
+        for (var z = junk.length - 1; z >= 0; z--) junk[z].remove();
+        restoreParagraphOrder(clone);
         var copiedImgs = clone.querySelectorAll("img");
-        for (var k = 0; k < originalImgs.length; k++) {
-          var original = originalImgs[k];
+        for (var k = 0; k < copiedImgs.length; k++) {
           var copied = copiedImgs[k];
+          var original = copied;
           if (!copied) continue;
           var src = "";
           var candidates = ["data-src", "data-original", "data-lazy-src", "data-echo", "data-url", "src"];
