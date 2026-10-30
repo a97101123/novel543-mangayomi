@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.6",
+  version: "0.2.7",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -182,18 +182,37 @@ class DefaultExtension extends MProvider {
     const entries = this.readCatalogEntries(catalog, id, catalogUrl);
     if (!entries.length) throw new Error("Linovelib：目錄沒有有效章節");
     await this.resolveVirtualChapters(entries, id);
+    // Mangayomi derives its reading order and "missing chapters" count
+    // from the FIRST number in each displayed title. Linovelib titles such as
+    // "插圖", "〇99%" and "5.25 ..." are not a sequential chapter series.
+    // Add a consecutive DISPLAY-ORDER prefix, while retaining the complete
+    // original title and URL. These numbers are catalog positions, NOT the
+    // publisher's real chapter numbering.
     const chapters = [];
     const seen = new Set();
     for (const entry of entries) {
       if (!entry.url || seen.has(entry.url)) continue;
       seen.add(entry.url);
-      chapters.push({name: entry.name, url: entry.url, dateUpload: null, scanlator: null});
+      const order = chapters.length + 1;
+      chapters.push({
+        name: this.mangayomiOrderedTitle(order, entry.name),
+        url: entry.url,
+        dateUpload: null,
+        scanlator: null
+      });
     }
     if (!chapters.length) throw new Error("Linovelib：沒有可閱讀的章節網址");
     return {
       name, link: bookUrl, author, artist: "", imageUrl, description,
       genre: genres, status: 5, chapters
     };
+  }
+
+  // Display-order key only; preserve the complete site chapter title.
+  // Four digits keep chapter ordering consistent for books with many entries.
+  mangayomiOrderedTitle(position, originalName) {
+    const number = String(position).padStart(4, "0");
+    return number + "｜" + String(originalName || "").trim();
   }
 
   validChapterUrl(url, bookId) {

@@ -34,13 +34,13 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
     "apiUrl": "",
-    "version": "0.2.6",
+    "version": "0.2.7",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.6: conservatively resolve catalog cid entries; clean verified site notices and repeated illustration credits; remove temporary image proxy diagnostics"
+    "notes": "v0.2.7: prefix a consecutive catalog-position number to chapter titles to fix Mangayomi sort and false missing-chapter warnings; preserve original titles, URLs, and v0.2.6 chapter recovery/content logic"
   }
 ]
