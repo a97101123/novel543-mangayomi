@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.10",
+  version: "0.2.11",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -390,36 +390,148 @@ class DefaultExtension extends MProvider {
     return found;
   }
 
+  // Matches book TITLES only. A category tag is not the same as the title
+  // containing that word. Normalise a limited set of T/S variants for matching.
+  titleMatchesQuery(title, keyword) {
+    const normalized = value => this.simplifyCommonSearchChars(String(value || ""))
+      .toLowerCase().replace(/[\s　·・,，.。:：'’"“”\-—_()（）\[\]【】「」！？!?|｜]+/g, "");
+    const needle = normalized(keyword);
+    return !!needle && normalized(title).includes(needle);
+  }
+
+  // Independent, public Google Programmable Search Engine (CSE) configured in
+  // the user's previously supplied Legado source. No protected site-search
+  // tickets are forged. A result must point to a Linovelib BOOK page.
+  async searchViaCse(keyword) {
+    if (typeof evaluateJavascriptViaWebview !== "function") {
+      throw new Error("Mangayomi 不支援背景 CSE 搜尋");
+    }
+    const url = "https://cse.google.com.hk/cse?cx=649de34f5e63448cb" +
+      "#gsc.tab=0&gsc.q=" + encodeURIComponent(keyword) + "&gsc.page=1";
+    const script = String.raw`(function () {
+      if (window.__linovelibCse211) return;
+      window.__linovelibCse211 = true;
+      var sent = false, timer, start = Date.now(), prior = "", stable = 0;
+      function done(value) {
+        if (sent) return;
+        sent = true;
+        clearInterval(timer);
+        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
+      }
+      function poll() {
+        if (document.querySelector("#recaptcha, .g-recaptcha, #captcha-form")) {
+          done({list:[], error:"verification_required"}); return;
+        }
+        var links = document.querySelectorAll(
+          ".gsc-webResult a.gs-title[href], .gsc-webResult .gs-title a[href], " +
+          ".gsc-result a.gs-title[href], .gsc-result .gs-title a[href]"
+        );
+        var list = [], seen = {};
+        for (var i=0; i<links.length; i++) {
+          var a=links[i], raw=a.href || a.getAttribute("href") || "";
+          var matched = raw.match(/(?:https?:\/\/)?(?:tw\.linovelib\.com|www\.linovelib\.com|www\.bilinovel\.com)\/novel\/(\d+)\.html/i);
+          if (!matched) {
+            try {
+              var target=new URL(raw, location.href);
+              var candidate=target.searchParams.get("q") || target.searchParams.get("url") || "";
+              matched=candidate.match(/(?:tw\.linovelib\.com|www\.linovelib\.com|www\.bilinovel\.com)\/novel\/(\d+)\.html/i);
+            } catch(_) {}
+          }
+          if (!matched || seen[matched[1]]) continue;
+          var name=(a.textContent || "").trim();
+          if (!name) continue;
+          seen[matched[1]]=true;
+          list.push({id:matched[1], name:name});
+        }
+        var sig=list.map(function(x){return x.id;}).join("|");
+        if (sig && sig===prior) stable++;
+        else { prior=sig; stable=0; }
+        if (list.length && stable>=2) {done({list:list,error:""});return;}
+        if (document.querySelector(".gs-no-results-result, .gsc-result-info-container .gs-no-results-result")) {
+          done({list:[],error:""}); return;
+        }
+        if (Date.now()-start>10500) done({list:list,error:list.length?"":"cse_unavailable_or_empty"});
+      }
+      timer=setInterval(poll,500);
+      poll();
+    })();`;
+    const raw = await evaluateJavascriptViaWebview(url, {}, [script], 14);
+    let value;
+    try { value=JSON.parse(String(raw || "")); }
+    catch (_) { throw new Error("CSE 回傳格式無法解析"); }
+    if (!value || !Array.isArray(value.list) || value.error) {
+      throw new Error("CSE 未取得結果（" + String(value?.error || "invalid_response") + "）");
+    }
+    const results=[], seen=new Set();
+    for(const item of value.list) {
+      if (!/^\d+$/.test(String(item.id || ""))) continue;
+      const link=this.source.baseUrl + "/novel/" + item.id + ".html";
+      const name=String(item.name || "")
+        .replace(/\s*[_|｜-]\s*(?:嗶哩輕小說|哔哩轻小说)[\s\S]*$/i, "")
+        .replace(/\s*(?:線上看|在线阅读|epub,?txt下載)[\s\S]*$/i, "").trim();
+      if (!this.titleMatchesQuery(name, keyword) || seen.has(link)) continue;
+      seen.add(link);
+      results.push({name,link,imageUrl:this.canonicalCover(link)});
+    }
+    return results;
+  }
+
+  // Search accessible catalogue pages by title; results are incomplete since
+  // these pages cover only a small portion of the site's full library.
+  async searchPublicTitles(keyword) {
+    const urls=[];
+    const base=this.source.baseUrl;
+    for (let n=1;n<=5;n++) urls.push(base + "/wenku/lastupdate_0_0_0_0_0_0_0_" + n + "_0.html");
+    for (let n=1;n<=2;n++) urls.push(base + "/wenku/allvisit_0_0_0_0_0_0_0_" + n + "_0.html");
+    if (/^(轉生|转生)$/.test(keyword)) {
+      for(let n=1;n<=3;n++) urls.push(base + "/wenku/lastupdate_26_0_0_0_0_0_0_" + n + "_0.html");
+    }
+    const out=[], seen=new Set();
+    // Keep requests bounded (and below the isolate timeout). Failures from a
+    // guarded/public page do not mean the query has no matches on the site.
+    const groups=[];
+    for(let i=0;i<urls.length;i+=4) groups.push(urls.slice(i,i+4));
+    for(const group of groups) {
+      const result=await Promise.allSettled(group.map(async url => {
+        const doc=await this.load(url);
+        return this.listFromPage(doc,url,false).list;
+      }));
+      for(const entry of result) {
+        if(entry.status!=="fulfilled") continue;
+        for(const item of entry.value) {
+          if(!this.titleMatchesQuery(item.name,keyword) || seen.has(item.link)) continue;
+          seen.add(item.link);
+          out.push(item);
+        }
+      }
+    }
+    return out;
+  }
+
   async search(query, page, filters) {
-    const word = String(query ?? "").trim();
-    if (!word || page < 1) return this.blank();
-    const id = this.searchBookId(word);
-    if (id) {
-      return page > 1 ? this.blank() : { list: await this.searchByBookId(id), hasNextPage: false };
+    const word=String(query ?? "").trim();
+    if (!word || page<1) return this.blank();
+    const id=this.searchBookId(word);
+    if (id) return page>1 ? this.blank() : {list:await this.searchByBookId(id),hasNextPage:false};
+    // Only page one is implemented; claiming further pages would imply
+    // comprehensive search that the restricted site does not provide.
+    if (page>1) return this.blank();
+    const [publicResult,cseResult]=await Promise.allSettled([
+      this.searchPublicTitles(word),this.searchViaCse(word)
+    ]);
+    const combined=[], seen=new Set();
+    for (const r of [cseResult,publicResult]) {
+      if (r.status!=="fulfilled") continue;
+      for(const item of r.value) {
+        if(!this.titleMatchesQuery(item.name,word) || seen.has(item.link)) continue;
+        seen.add(item.link);
+        combined.push(item);
+      }
     }
-    // Prefer the site's public category page for a recognized genre term.
-    // Do not spend time requesting a ticket that the server currently refuses.
-    const category = await this.searchPublicCategory(word, page).catch(() => null);
-    if (category) return category;
-    if (page > 1) return this.blank();
-    let httpError;
-    try {
-      const list = await this.searchGuarded(word);
-      if (list.length) return { list, hasNextPage: false };
-    } catch (error) { httpError = error; }
-    // Browser-mode fallback, with the correct search host; do not reuse the
-    // previous TW search route which may redirect to local 127.0.0.1:80.
-    try {
-      const url = "https://www.bilinovel.com/search.html?searchkey=" + encodeURIComponent(this.simplifyCommonSearchChars(word));
-      const list = await this.searchViaBrowser(url, word);
-      return { list, hasNextPage: false };
-    } catch (error) {
-      const fallback = await this.searchPublicListings(word).catch(() => []);
-      if (fallback.length) return { list: fallback, hasNextPage: false };
-      throw new Error("Linovelib v0.2.10：網站完整搜尋未通過驗證；公開書庫也沒有找到符合標題的作品。" +
-        "書籍 ID 可直接查詢；一般名稱搜尋需網站正常核發票證。" +
-        "網站搜尋：" + String(httpError || "無結果") + "；背景瀏覽器：" + String(error));
-    }
+    if (combined.length) return {list:combined.slice(0,45),hasNextPage:false};
+    throw new Error("Linovelib v0.2.11：目前未從 Google 自訂搜尋或有限範圍的公開書庫找到符合書名的作品。" +
+      "這不是全站搜尋結果，無法判定該書不存在；可改用書籍 ID 查詢。" +
+      (cseResult.status==="rejected" ? " CSE："+String(cseResult.reason) : ""));
   }
 
   novelId(url) {

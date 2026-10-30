@@ -32,15 +32,15 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.10",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.11",
     "apiUrl": "",
-    "version": "0.2.10",
+    "version": "0.2.11",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.10: restore deterministic paragraph order, remove hidden decoy nodes and exact long duplicates, use public tag catalogue for 轉生 when site keyword ticket is unavailable; keep novel543 unchanged"
+    "notes": "v0.2.11: novel title matching via user-supplied Legado Google CSE and bounded public catalogue pages; filter tag-category matches; preserve chapter order and content; no guaranteed full-site search"
   }
 ]
