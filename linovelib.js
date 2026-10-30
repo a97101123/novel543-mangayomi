@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.14",
+  version: "0.2.15",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -893,7 +893,7 @@ class DefaultExtension extends MProvider {
   // Read the *first non-empty* recognized chapter container.
   // Some pages contain #acontentz but populate #acontent instead.
   readChapterBody(doc, chapterUrl) {
-    const selectors = ["#acontent", "#acontentz", "#TextContent", ".chapter-content"];
+    const selectors = ["#acontent1", "#acontentz", "#acontent", "#TextContent", ".chapter-content", "#ccacontent"];
     let anyContainer = false;
     for (const selector of selectors) {
       const el = doc.selectFirst(selector);
@@ -921,22 +921,36 @@ class DefaultExtension extends MProvider {
     throw new Error("Linovelib：正文容器存在但沒有可用文字。網站可能以 JavaScript 動態載入；請先用 WebView 開啟該章");
   }
 
+  // Chapter-only, single request with a short network timeout. Regular
+  // book/catalogue requests keep their existing reliability behavior.
+  // A 429 is a server rate limit, never something to retry in a tight loop.
+  async loadChapterOnce(url) {
+    const response = await new Client({timeout: 7}).get(url, this.getHeaders(url));
+    const status = Number(response?.statusCode ?? response?.status ?? 0);
+    if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試");
+    if (status === 403 || status === 401) throw new Error("Linovelib：網站要求驗證（HTTP " + status + "）");
+    if (status >= 400 || !response?.body) throw new Error("Linovelib：HTTP " + status + " 或空白回應");
+    return new Document(String(response.body));
+  }
+
   // The source chapter HTML often contains a placeholder rather than text.
   // Open a *headless* WebView first, avoiding a normally wasted HTTP request.
   // This is NOT the manual WebView button in the app.
+  // Rendered WebView is the only request in the normal path. Unlike the old
+  // 19s polling loop, find the site's declared content id (ReadTools.contentid)
+  // and return as soon as the complete chapter DOM is stable.
   async readRenderedChapter(chapterUrl) {
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
     const script = String.raw`(function () {
-      if (window.__linovelibCaptureV0210) return;
-      window.__linovelibCaptureV0210 = true;
+      if (window.__linovelibFast215) return;
+      window.__linovelibFast215 = true;
       var finished = false;
       var start = Date.now();
       var signature = "";
       var stableCount = 0;
       var timer = null;
-
       function report(value) {
         if (finished) return;
         finished = true;
@@ -947,9 +961,6 @@ class DefaultExtension extends MProvider {
         return !!value && !/^(?:data:|blob:|javascript:|#)/i.test(value) &&
           !/placeholder|loading|blank|no[-_]?image/i.test(value);
       }
-      // Reverse the site's deterministic permutation of content paragraphs.
-      // Only direct non-empty <p> children participate. Other elements,
-      // including images, remain at their original positions.
       function restoreParagraphOrder(root) {
         var match = location.pathname.match(/\/novel\/\d+\/(\d+)(?:_\d+)?\.html$/);
         if (!match) return;
@@ -1011,54 +1022,90 @@ class DefaultExtension extends MProvider {
         }
         return clone.innerHTML;
       }
-      function poll() {
-        var selectors = ["#acontent", "#acontentz", "#TextContent", ".chapter-content"];
-        var best = null;
-        for (var i = 0; i < selectors.length; i++) {
-          var el = document.querySelector(selectors[i]);
-          if (!el) continue;
-          var plain = (el.innerText || el.textContent || "").trim();
-          var html = (el.innerHTML || "").trim();
-          var count = el.querySelectorAll("img").length;
-          if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain)) continue;
-          var len = plain.replace(/\s+/g, "").length;
-          if (!html || (len < 80 && count === 0)) continue;
-          var score = len + count * 60;
-          if (!best || score > best.score) best = { el: el, score: score, len: len, count: count };
-        }
-        if (best) {
-          var html = snapshot(best.el);
-          var fresh = html.length + ":" + best.len + ":" + best.count + ":" + html.slice(-30);
-          if (fresh === signature) stableCount++;
-          else { signature = fresh; stableCount = 0; }
-          // ~1.5s of stable content, not the old ~2.4s plus HTTP fallback.
-          if (stableCount >= 3 && Date.now() - start >= 1100) {
-            var next = (window.ReadParams && window.ReadParams.url_next) || "";
-            // The scraper's pagination strategy also reads script-defined
-            // ReadParams. This is a fallback if window.ReadParams is absent.
-            if (!next) {
-              var scripts = document.querySelectorAll("script");
-              for (var n = 0; n < scripts.length; n++) {
-                var found = String(scripts[n].textContent || "").match(/\burl_next\s*:\s*['"]([^'"]+\.html)['"]/i);
-                if (found) { next = found[1]; break; }
-              }
-            }
-            report({ html: html, next: next, title: (document.querySelector("#atitle") || {}).textContent || "", error: "" });
-            return;
+      function detectGuard() {
+        var title = String(document.title || "");
+        var text = String((document.body && (document.body.innerText || document.body.textContent)) || "").slice(0,1400);
+        if (/429|Too Many Requests|請求過於頻繁|请求过于频繁|訪問過於頻繁|访问过于频繁/i.test(title)) return "rate_limited";
+        if (/^\s*(?:429|Too Many Requests|Rate Limit Exceeded)/i.test(text)) return "rate_limited";
+        if (/Just a moment|Checking your browser|安全驗證|安全验证/i.test(title) ||
+            document.querySelector("#challenge-form, #cf-challenge-running, .cf-challenge")) return "verification_required";
+        return "";
+      }
+      function candidateElements() {
+        var nodes = [], seen = [];
+        function add(node) { if (node && seen.indexOf(node)<0) { seen.push(node); nodes.push(node); } }
+        // Linovelib's own reading script may change the content id; don't
+        // assume it is always #acontent or #acontentz.
+        try {
+          var id = window.ReadTools && window.ReadTools.contentid;
+          if (id && /^[A-Za-z][\w:-]{0,70}$/.test(id)) add(document.getElementById(id));
+        } catch (_) {}
+        ["acontent1", "acontentz", "acontent", "TextContent", "ccacontent"].forEach(function(id) {
+          add(document.getElementById(id));
+        });
+        var extra = document.querySelectorAll("[id^='acontent'], .chapter-content");
+        for (var x=0; x<extra.length && x<15; x++) add(extra[x]);
+        return nodes;
+      }
+      function getNext() {
+        var next = (window.ReadParams && window.ReadParams.url_next) || "";
+        if (!next) {
+          var scripts = document.querySelectorAll("script");
+          for (var n=0; n<scripts.length; n++) {
+            var found = String(scripts[n].textContent || "").match(/\burl_next\s*:\s*['"]([^'"]+\.html)['"]/i);
+            if (found) {next = found[1]; break;}
           }
         }
-        if (Date.now() - start > 19000) {
-          report({ html: "", next: "", error: best ? "content_unstable" : "content_missing" });
+        return next;
+      }
+      function poll() {
+        try {
+          var elapsed = Date.now() - start;
+          var guard = detectGuard();
+          if (guard) {report({html:"",error:guard,next:""}); return;}
+          var best = null;
+          var nodes = candidateElements();
+          for (var i=0; i<nodes.length; i++) {
+            var el = nodes[i];
+            if (!el) continue;
+            var plain = String(el.innerText || el.textContent || "").trim();
+            var count = el.querySelectorAll("img").length;
+            var len = plain.replace(/\s+/g, "").length;
+            if (/內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i.test(plain.slice(0,140))) continue;
+            // Don't accept a loading placeholder, menu, or empty chapter.
+            if ((len < 75 && count===0) || !String(el.innerHTML||"").trim()) continue;
+            var para = el.querySelectorAll("p").length;
+            var score = len + count * 70 + para * 4;
+            if (!best || score > best.score) best = {el:el,len:len,count:count,para:para,score:score};
+          }
+          if (best) {
+            // Avoid expensive cloning/reordering during every readiness poll.
+            var raw = String(best.el.innerHTML||"");
+            var current = [best.len, best.count, best.para, raw.length, raw.slice(-50)].join(":");
+            if (current === signature) stableCount++;
+            else { signature=current; stableCount=0; }
+            // Two stable polls (~600ms) after the browser's onLoadStop.
+            // An illustration-only page can still succeed with count>0.
+            if (stableCount>=2 && elapsed>=650) {
+              report({html:snapshot(best.el),next:getNext(),title:(document.querySelector("#atitle")||{}).textContent||"",error:""});
+              return;
+            }
+          }
+          if (elapsed >= 9500) {
+            report({html:"",next:"",error:best?"content_unstable":"content_missing"});
+          }
+        } catch (err) {
+          report({html:"",next:"",error:"capture_error:"+String(err)});
         }
       }
-      timer = setInterval(poll, 500);
+      timer = setInterval(poll, 300);
       poll();
     })();`;
 
     let result;
     try {
       result = await evaluateJavascriptViaWebview(
-        chapterUrl, this.getHeaders(chapterUrl), [script], 24
+        chapterUrl, this.getHeaders(chapterUrl), [script], 12
       );
     } catch (error) {
       throw new Error("Linovelib：背景載入失敗：" + String(error));
@@ -1067,7 +1114,10 @@ class DefaultExtension extends MProvider {
     try { payload = JSON.parse(String(result || "")); }
     catch (_) { throw new Error("Linovelib：背景 WebView 沒有回傳有效 JSON"); }
     if (!payload || !payload.html) {
-      throw new Error("Linovelib：背景載入沒有取得完整正文（" + String(payload?.error || "no_result") + "）");
+      const reason = String(payload?.error || "no_result");
+      if (reason === "rate_limited") throw new Error("Linovelib：背景頁面已被限流（HTTP 429），請稍後再試");
+      if (reason === "verification_required") throw new Error("Linovelib：網站要求驗證，請在 WebView 完成驗證");
+      throw new Error("Linovelib：背景載入沒有取得完整正文（" + reason + "）");
     }
     const html = this.cleanContent(payload.html, chapterUrl, payload.title || "");
     if (!html) throw new Error("Linovelib：背景載入後正文仍為空");
@@ -1099,10 +1149,15 @@ class DefaultExtension extends MProvider {
       } catch (error) {
         webviewError = error;
       }
-      // HTTP is the fallback now; for most dynamic chapters it cannot see the text.
+      // Don't send another request when the server has explicitly rate-limited
+      // or challenged the browser; this only adds latency and may worsen 429.
+      if (!html && /HTTP 429|要求驗證|verification_required|rate_limited/.test(String(webviewError || ""))) {
+        throw webviewError;
+      }
+      // One short HTTP attempt is reserved for unexpected browser failures.
       if (!html) {
         try {
-          const doc = await this.load(currentUrl);
+          const doc = await this.loadChapterOnce(currentUrl);
           html = this.readChapterBody(doc, currentUrl);
           const candidate = this.nextSubPage(doc, currentUrl);
           if (this.isChapterContinuation(currentUrl, candidate)) next = candidate;
