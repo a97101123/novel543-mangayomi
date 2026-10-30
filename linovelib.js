@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.16",
+  version: "0.2.17",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -500,39 +500,50 @@ class DefaultExtension extends MProvider {
     return results;
   }
 
-  // Public catalogue search remains deliberately bounded. The official
-  // keyword-search endpoint requires a server-issued ticket that this source
-  // cannot always obtain. A missing match below is NOT a whole-site no-match.
+  // Respect the site's published request limits. Searching a title is not
+  // permission to crawl dozens of catalogue pages: sample at most eight,
+  // use two concurrent requests, and stop immediately after any HTTP 429.
+  // This is a LIMITED public-title match, not full-site search.
   async searchPublicTitles(keyword) {
-    const urls=[];
-    const base=this.source.baseUrl;
-    // Read additional published catalogue pages, not guessed book IDs.
-    for(let n=1;n<=10;n++) urls.push(base + "/wenku/lastupdate_0_0_0_0_0_0_0_" + n + "_0.html");
-    for(let n=1;n<=5;n++) urls.push(base + "/wenku/allvisit_0_0_0_0_0_0_0_" + n + "_0.html");
+    const base = this.source.baseUrl;
+    const latest = n => base + "/wenku/lastupdate_0_0_0_0_0_0_0_" + n + "_0.html";
+    const popular = n => base + "/wenku/allvisit_0_0_0_0_0_0_0_" + n + "_0.html";
+    const urls = [latest(1), popular(1), latest(2), popular(2), latest(3), latest(4)];
     if (/^(轉生|转生)$/.test(keyword)) {
-      for(let n=1;n<=3;n++) urls.push(base + "/wenku/lastupdate_26_0_0_0_0_0_0_" + n + "_0.html");
+      const category = n => base + "/wenku/lastupdate_26_0_0_0_0_0_0_" + n + "_0.html";
+      // Query the published category early, without treating unrelated
+      // category entries as matches for the user's book-title query.
+      urls.splice(2, 0, category(1), category(2));
     }
-    const out=[], seen=new Set();
-    let reachablePages=0, checkedTitles=0;
-    // Bounded concurrency to avoid overwhelming the website and to fit
-    // Mangayomi's per-search timeout. No unbounded archive crawl.
-    for(let i=0;i<urls.length;i+=6) {
-      const results=await Promise.allSettled(urls.slice(i,i+6).map(async url => {
-        const doc=await this.load(url);
-        return this.listFromPage(doc,url,false).list;
+    const out = [], seen = new Set();
+    let reachablePages = 0, checkedTitles = 0, rateLimited = false;
+    for (let i = 0; i < urls.length; i += 2) {
+      const batch = await Promise.allSettled(urls.slice(i, i + 2).map(async url => {
+        const doc = await this.load(url);
+        return this.listFromPage(doc, url, false).list;
       }));
-      for(const result of results) {
-        if(result.status!=="fulfilled" || !Array.isArray(result.value) || result.value.length===0) continue;
+      for (const entry of batch) {
+        if (entry.status !== "fulfilled") {
+          if (/\b429\b|限制請求頻率|Too Many Requests/i.test(String(entry.reason))) rateLimited = true;
+          continue;
+        }
+        if (!Array.isArray(entry.value) || !entry.value.length) continue;
         reachablePages++;
-        checkedTitles+=result.value.length;
-        for(const item of result.value) {
-          if(!this.titleMatchesQuery(item.name,keyword) || seen.has(item.link)) continue;
+        checkedTitles += entry.value.length;
+        for (const item of entry.value) {
+          if (!this.titleMatchesQuery(item.name, keyword) || seen.has(item.link)) continue;
           seen.add(item.link);
           out.push(item);
         }
       }
+      // Stop issuing extra catalogue requests once enough matches exist,
+      // or as soon as the server requests fewer connections.
+      if (rateLimited || out.length >= 6) break;
     }
-    return {list:out,reachablePages,checkedTitles};
+    if (rateLimited && !out.length) {
+      throw new Error("Linovelib：公開書庫回傳 HTTP 429，停止搜尋請求，請稍後再試");
+    }
+    return {list: out, reachablePages, checkedTitles};
   }
 
   async search(query, page, filters) {
@@ -560,7 +571,7 @@ class DefaultExtension extends MProvider {
     // The extension notes explain that coverage is not all-site search.
     if(publicResult.status==="fulfilled" && publicResult.value.reachablePages>0) return this.blank();
     // No search source worked: do NOT falsely report that the book is absent.
-    throw new Error("Linovelib v0.2.14：搜尋來源無法存取，無法判定書名是否存在。" +
+    throw new Error("Linovelib v0.2.17：搜尋來源無法存取，無法判定書名是否存在。" +
       "可改用書籍 ID 查詢；網站完整搜尋須有正常核發的搜尋票證。" +
       (publicResult.status==="rejected" ? " 公開書庫："+String(publicResult.reason) : "") +
       (cseResult.status==="rejected" ? " CSE："+String(cseResult.reason) : ""));
