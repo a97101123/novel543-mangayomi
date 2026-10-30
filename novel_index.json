@@ -34,13 +34,13 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
     "apiUrl": "",
-    "version": "0.2.8",
+    "version": "0.2.9",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.8: browser-backed search and direct ID lookup, with HTTP fallback; preserve v0.2.7 chapter ordering/content"
+    "notes": "v0.2.9: direct book-ID search with HTTP and headless WebView fallback; guarded keyword search on bilinovel host with only site-issued session cookies; preserve catalog and reading behavior"
   }
 ]

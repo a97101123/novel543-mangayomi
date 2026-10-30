@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.8",
+  version: "0.2.9",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -15,11 +15,15 @@ const mangayomiSources = [{
 
 class DefaultExtension extends MProvider {
   getHeaders(url) {
-    return { "Referer": "https://tw.linovelib.com/" };
+    const searchHost = /^https?:\/\/www\.bilinovel\.com\//i.test(String(url || ""));
+    return {
+      "Referer": searchHost ? "https://www.bilinovel.com/" : "https://tw.linovelib.com/",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7"
+    };
   }
 
   async load(url) {
-    const response = await new Client().get(url);
+    const response = await new Client().get(url, this.getHeaders(url));
     if (!response || !response.body) {
       throw new Error("Linovelib：網頁沒有回傳 HTML");
     }
@@ -209,7 +213,8 @@ class DefaultExtension extends MProvider {
     }
     const list = [], seen = new Set();
     for (const item of data.list) {
-      const link = this.absolute(item?.link, searchUrl);
+      const link = this.absolute(item?.link, searchUrl)
+        .replace(/^https?:\/\/www\.bilinovel\.com/i, this.source.baseUrl);
       if (!this.bookPath(link) || seen.has(link)) continue;
       const name = String(item.name || "").trim();
       if (!name) continue;
@@ -219,43 +224,154 @@ class DefaultExtension extends MProvider {
     return list;
   }
 
-  async search(query, page, filters) {
-    const word = String(query || "").trim();
-    if (!word || page < 1) return this.blank();
-    const direct = word.match(/(?:^|\/novel\/)(\d+)(?:\.html)?(?:[?#].*)?$/);
-    if (direct) {
-      if (page > 1) return this.blank();
-      const bookUrl = this.source.baseUrl + "/novel/" + direct[1] + ".html";
-      const doc = await this.load(bookUrl);
-      const name = this.attr(doc.selectFirst('meta[property="og:novel:book_name"]'), "content") || this.txt(this.first(doc, [".book-title", "h1"]));
-      if (!name) return this.blank();
-      const imageUrl = this.absolute(this.attr(doc.selectFirst('meta[property="og:image"]'), "content"), bookUrl) || this.canonicalCover(bookUrl);
-      return {list: [{name, link:bookUrl, imageUrl}], hasNextPage:false};
-    }
-    const keyword = encodeURIComponent(word);
-    // Do not append searchtype=all: that parameter is absent from the
-    // documented site search route and may trigger a different response.
-    const url = page <= 1
-      ? this.source.baseUrl + "/search.html?searchkey=" + keyword
-      : this.source.baseUrl + "/search/" + keyword + "_" + page + ".html";
-    let browserError = null;
+  // Search and book-detail pages use different hosts. Numeric IDs should
+  // never be sent to the site's guarded keyword-search endpoint.
+  searchBookId(word) {
+    const m = String(word || "").trim().match(/^(?:https?:\/\/(?:tw\.linovelib\.com|www\.bilinovel\.com))?(?:\/novel\/)?(\d+)(?:\.html)?(?:[?#].*)?$/i);
+    return m ? m[1] : "";
+  }
+
+  // The HTTP lookup is the cheap path; the headless browser is a fallback.
+  // If both fail, a clearly labelled direct navigation result is returned
+  // rather than silently reporting that a user-supplied book ID does not exist.
+  async searchByBookId(bookId) {
+    const bookUrl = this.source.baseUrl + "/novel/" + bookId + ".html";
+    let firstError = null;
     try {
-      const list = await this.searchViaBrowser(url, word);
-      return { list, hasNextPage: list.length >= 20 };
-    } catch (err) { browserError = err; }
+      const response = await new Client().get(bookUrl, this.getHeaders(bookUrl));
+      const status = Number(response?.statusCode ?? response?.status ?? 200);
+      if (status >= 400 || !response?.body) throw new Error("HTTP " + status);
+      const doc = new Document(response.body);
+      const name = this.attr(doc.selectFirst('meta[property="og:novel:book_name"]'), "content") ||
+        this.txt(this.first(doc, [".book-detail-info .book-title", ".book-title", "h1"]));
+      if (!name || /Just a moment|Checking your browser|安全驗證/i.test(name)) throw new Error("非書籍詳情頁");
+      const imageUrl = this.absolute(this.attr(doc.selectFirst('meta[property="og:image"]'), "content"), bookUrl) ||
+        this.canonicalCover(bookUrl);
+      return [{ name, link: bookUrl, imageUrl }];
+    } catch (error) { firstError = error; }
     try {
-      const response = await new Client().get(url, this.getHeaders(url));
-      const status = Number(response?.statusCode || response?.status || 200);
-      const html = String(response?.body || "");
-      if (!html || [403, 429, 503].includes(status) || /jieqiSearchTicket|search_guard|cf-challenge|challenge-platform/i.test(html.slice(0,5000))) {
-        throw new Error("網站搜尋需要額外驗證或回傳非結果頁面");
+      const list = await this.searchViaBrowser(bookUrl, bookId);
+      if (list.length) return list.map(book => ({ ...book, link: bookUrl }));
+    } catch (_) { /* No browser support is required for the last fallback. */ }
+    // A URL shortcut, NOT an assertion that a page exists. The user explicitly
+    // supplied an ID; opening the card delegates validation to getDetail().
+    return [{
+      name: "書籍 ID " + bookId + "（點擊開啟詳情；尚未驗證）",
+      link: bookUrl,
+      imageUrl: this.canonicalCover(bookUrl)
+    }];
+  }
+
+  // Only parse cookies that the site has issued. We do not invent tokens,
+  // silently ignore verification failures, or attempt to solve a CAPTCHA.
+  searchCookieFromHeader(response, cookieName) {
+    const headers = response?.headers || {};
+    let raw = "";
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "set-cookie") {
+        const value = headers[key];
+        raw += " " + (Array.isArray(value) ? value.join("; ") : String(value || ""));
       }
-      const doc = new Document(html);
-      const list = this.listFromPage(doc, url, true).list;
-      if (list.length) return {list, hasNextPage:list.length >= 20};
-      throw new Error("搜尋頁面無法辨識書籍清單");
-    } catch (err) {
-      throw new Error("Linovelib：網站搜尋失敗。瀏覽器模式：" + String(browserError) + "；HTTP 模式：" + String(err) + "。若出現 127.0.0.1:80，請檢查 Mangayomi 網路代理或網站搜尋驗證狀態。");
+    }
+    const m = raw.match(new RegExp("(?:^|[,;\\s])" + cookieName + "=([^;,\\s]+)", "i"));
+    return m ? m[1] : "";
+  }
+
+  searchGuardHeaders(url, cookies) {
+    const headers = this.getHeaders(url);
+    headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/135.0.0.0 Mobile Safari/537.36";
+    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    headers["Cache-Control"] = "no-cache";
+    if (cookies) headers["Cookie"] = cookies;
+    return headers;
+  }
+
+  // The search host primarily indexes simplified Chinese. A conservative
+  // character map helps common Traditional Chinese queries without changing
+  // the original query shown to the user. This is not full OpenCC conversion.
+  simplifyCommonSearchChars(word) {
+    const pairs = {
+      "轉":"转", "實":"实", "歡":"欢", "來":"来", "級":"级", "輕":"轻", "說":"说",
+      "異":"异", "夢":"梦", "劍":"剑", "龍":"龙", "書":"书", "學":"学", "職":"职",
+      "國":"国", "為":"为", "開":"开", "覺":"觉", "戀":"恋", "愛":"爱", "貓":"猫",
+      "關":"关", "於":"于", "這":"这", "個":"个", "現":"现", "樣":"样", "遊":"游",
+      "戲":"戏", "機":"机", "會":"会", "體":"体", "隨":"随", "從":"从", "歲":"岁",
+      "對":"对", "戰":"战", "敗":"败", "壞":"坏", "帶":"带", "種":"种", "發":"发",
+      "長":"长", "廣":"广", "終":"终", "續":"续", "電":"电", "話":"话", "進":"进"
+    };
+    return Array.from(String(word || "")).map(ch => pairs[ch] || ch).join("");
+  }
+
+  async searchGuarded(word) {
+    // Search service protocol observed in the site's public client: acquire
+    // server-issued JS/CSS guard cookies, redeem them for a search ticket, and
+    // perform the ordinary search. The TW site is the book-data origin.
+    const host = "https://www.bilinovel.com";
+    const client = new Client();
+    const fetch = async (stage, url, cookies) => {
+      let response;
+      try { response = await client.get(url, this.searchGuardHeaders(url, cookies)); }
+      catch (e) { throw new Error(stage + "：" + String(e)); }
+      const code = Number(response?.statusCode ?? response?.status ?? 0);
+      if (!response || code >= 400) throw new Error(stage + "：HTTP " + code);
+      return response;
+    };
+    const js = await fetch("JS guard", host + "/search.html?search_guard=js", "");
+    const jsMatch = String(js.body || "").match(/(?:^|["'])jieqiSearchJs=([^;"']+)/);
+    if (!jsMatch) throw new Error("JS guard：沒有收到網站核發的搜尋權杖");
+    const css = await fetch("CSS guard", host + "/search.html?search_guard=css", "");
+    const cssToken = this.searchCookieFromHeader(css, "jieqiSearchCss");
+    if (!cssToken) throw new Error("CSS guard：沒有收到網站 Cookie");
+    const requestCookies = "night=0; jieqiSearchJs=" + jsMatch[1] + "; jieqiSearchCss=" + cssToken;
+    const redeem = await fetch("Ticket", host + "/search.html?search_guard=redeem&r=" + Date.now(), requestCookies);
+    const ticket = this.searchCookieFromHeader(redeem, "jieqiSearchTicket");
+    if (!ticket) throw new Error("Ticket：網站未核發搜尋票證");
+    const url = host + "/search.html?searchkey=" + encodeURIComponent(this.simplifyCommonSearchChars(word));
+    const response = await fetch("Search", url, "jieqiSearchTicket=" + ticket);
+    const html = String(response.body || "");
+    if (!html || /cf-challenge|challenge-platform|search_guard=|jieqiSearchTicket/i.test(html.slice(0,3000))) {
+      throw new Error("Search：網站回傳驗證頁而非搜尋結果");
+    }
+    const doc = new Document(html);
+    const directUrl = this.attr(doc.selectFirst('meta[property="og:url"]'), "content");
+    const redirectedBook = this.novelId(directUrl);
+    if (redirectedBook && /og:novel:book_name/.test(html)) {
+      const bookUrl = this.source.baseUrl + "/novel/" + redirectedBook + ".html";
+      const name = this.attr(doc.selectFirst('meta[property="og:novel:book_name"]'), "content");
+      if (name) return [{ name, link: bookUrl, imageUrl: this.absolute(this.attr(doc.selectFirst('meta[property="og:image"]'), "content"), bookUrl) || this.canonicalCover(bookUrl) }];
+    }
+    const list = this.listFromPage(doc, url, true).list;
+    // Translate search host links back to the established TW site so that
+    // library identities and existing saved chapter URLs remain unchanged.
+    return list.map(item => ({
+      ...item,
+      link: String(item.link).replace(/^https?:\/\/www\.bilinovel\.com/i, this.source.baseUrl)
+    }));
+  }
+
+  async search(query, page, filters) {
+    const word = String(query ?? "").trim();
+    if (!word || page < 1) return this.blank();
+    const id = this.searchBookId(word);
+    if (id) {
+      return page > 1 ? this.blank() : { list: await this.searchByBookId(id), hasNextPage: false };
+    }
+    // For the first iteration, the guarded search session only guarantees a
+    // single page. Returning false avoids a misleading infinite page spinner.
+    if (page > 1) return this.blank();
+    let httpError;
+    try {
+      const list = await this.searchGuarded(word);
+      if (list.length) return { list, hasNextPage: false };
+    } catch (error) { httpError = error; }
+    // Browser-mode fallback, with the correct search host; do not reuse the
+    // previous TW search route which may redirect to local 127.0.0.1:80.
+    try {
+      const url = "https://www.bilinovel.com/search.html?searchkey=" + encodeURIComponent(this.simplifyCommonSearchChars(word));
+      const list = await this.searchViaBrowser(url, word);
+      return { list, hasNextPage: false };
+    } catch (error) {
+      throw new Error("Linovelib v0.2.9：搜尋未完成。網站搜尋流程：" + String(httpError || "無結果") + "；背景瀏覽器：" + String(error) + "。書籍 ID 可直接搜尋，網站驗證需由使用者正常完成。");
     }
   }
 
