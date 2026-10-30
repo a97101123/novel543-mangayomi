@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.20",
+  version: "0.2.21",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -20,6 +20,23 @@ class DefaultExtension extends MProvider {
       "Referer": searchHost ? "https://www.bilinovel.com/" : "https://tw.linovelib.com/",
       "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7"
     };
+  }
+
+  // The source runs in QuickJS, which does not provide a reliable sleep API.
+  // Wait INSIDE the page's actual WebView before acknowledging the captured
+  // content, so the next chapter-page navigation is paced without busy-waiting.
+  // A smaller delay reduces waiting time but may trigger the site's rate limit.
+  async chapterPaceRange() {
+    let choice = "5000";
+    try {
+      if (typeof SharedPreferences !== "undefined") {
+        const v = await new SharedPreferences().get("linovelib_chapter_pace");
+        if (v !== null && v !== undefined) choice = String(v);
+      }
+    } catch (_) {}
+    if (choice === "8000") return {min:8000, jitter:3000};
+    if (choice === "2000") return {min:2000, jitter:2000};
+    return {min:5000, jitter:2000};
   }
 
   // Rate-limit protection for this source. Mangayomi's embedded JS runtime
@@ -1117,14 +1134,14 @@ class DefaultExtension extends MProvider {
   // Fallback only: render JavaScript-created or font-obfuscated chapter text
   // when static HTML cannot be verified. This is a headless WebView, not the
   // manual WebView button. Keep the v0.2.15 stable-content capture behavior.
-  async readRenderedChapter(chapterUrl) {
+  async readRenderedChapter(chapterUrl, pace = {min:5000, jitter:2000}) {
     await this.ensureRateAllowed();
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
     const script = String.raw`(function () {
-      if (window.__linovelibFast215) return;
-      window.__linovelibFast215 = true;
+      if (window.__linovelibPaced221) return;
+      window.__linovelibPaced221 = true;
       var finished = false;
       var start = Date.now();
       var signature = "";
@@ -1134,7 +1151,18 @@ class DefaultExtension extends MProvider {
         if (finished) return;
         finished = true;
         if (timer) clearInterval(timer);
-        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
+        // Rate-limit and verification errors report immediately, with no
+        // automatic retry. For a verified page that has a next page, spacing
+        // the success acknowledgement spaces the NEXT network navigation.
+        // This timer is a WebView timer, not a QuickJS busy-wait.
+        var delay = (value && value.html && value.next)
+          ? ${Math.max(0, Math.min(10000, Number(pace.min) || 5000))} + Math.floor(Math.random() * ${Math.max(1, Math.min(4000, Number(pace.jitter) || 2000))})
+          : 0;
+        var send = function () {
+          window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
+        };
+        if (delay > 0) setTimeout(send, delay);
+        else send();
       }
       function validSrc(value) {
         return !!value && !/^(?:data:|blob:|javascript:|#)/i.test(value) &&
@@ -1284,7 +1312,7 @@ class DefaultExtension extends MProvider {
     let result;
     try {
       result = await evaluateJavascriptViaWebview(
-        chapterUrl, this.getHeaders(chapterUrl), [script], 12
+        chapterUrl, this.getHeaders(chapterUrl), [script], 30
       );
     } catch (error) {
       throw new Error("Linovelib：背景載入失敗：" + String(error));
@@ -1409,7 +1437,10 @@ class DefaultExtension extends MProvider {
     const parts = resume ? resume.parts.slice() : [];
     const pageUrls = resume ? resume.urls.slice() : [];
     const visited = new Set(pageUrls);
-    let preferred = resume?.preferred === "browser" ? "browser" : "http";
+    // Prefer one paced WebView navigation per part over an HTTP probe plus
+    // a WebView fallback for the same page. Resume records stay compatible.
+    let preferred = "browser";
+    const chapterPace = await this.chapterPaceRange();
     for (let page = parts.length + 1; page <= limit; page++) {
       if (visited.has(currentUrl))
         throw new Error("Linovelib：章節分頁循環，第 " + page + " 頁（" + currentUrl + "）");
@@ -1429,7 +1460,7 @@ class DefaultExtension extends MProvider {
       };
       const tryBrowser = async () => {
         try {
-          const rendered = await this.readRenderedChapter(currentUrl);
+          const rendered = await this.readRenderedChapter(currentUrl, chapterPace);
           next = this.checkedContinuation(currentUrl, rendered.next);
           html = rendered.html;
           preferred = "browser";
@@ -1441,7 +1472,11 @@ class DefaultExtension extends MProvider {
       try {
         if (preferred === "browser") {
           await tryBrowser();
-          if (!html) await tryHttp();
+          // Do not double-request a WebView page that failed or was blocked.
+          // HTTP is an emergency fallback ONLY when the host app offers no
+          // embedded WebView support at all.
+          if (!html && /不支援背景 WebView/.test(String(browserError || "")))
+            await tryHttp();
         } else {
           await tryHttp();
           if (!html) await tryBrowser();
@@ -1481,5 +1516,16 @@ class DefaultExtension extends MProvider {
   }
 
   getFilterList() { return []; }
-  getSourcePreferences() { return []; }
+  getSourcePreferences() {
+    return [{
+      key: "linovelib_chapter_pace",
+      listPreference: {
+        title: "章節分頁抓取間隔（WebView）",
+        summary: "每成功讀完一個網站分頁後再等候，降低 HTTP 429 風險；長章節會更慢，無法保證免於限流。",
+        valueIndex: 0,
+        entries: ["標準慢速：5～7 秒（預設）", "保守慢速：8～11 秒", "較快：2～4 秒"],
+        entryValues: ["5000", "8000", "2000"]
+      }
+    }];
+  }
 }
