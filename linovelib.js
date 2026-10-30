@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.21",
+  version: "0.2.22",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -926,6 +926,69 @@ class DefaultExtension extends MProvider {
     return output;
   }
 
+  // Render-only optimization. Does not change the original chapter URLs,
+  // chapter listing, WebView request pace, image nodes, or purchase state.
+  // The official Mangayomi paginator measures every HTML block with a
+  // TextPainter. Very long plain <p> nodes can trigger expensive splitting.
+  // Keep the source's exact characters and preserve inline markup where it
+  // matters (especially custom fonts, ruby text, images and linked notes).
+  async readCompactReaderPreference() {
+    let enabled = "on";
+    try {
+      if (typeof SharedPreferences !== "undefined") {
+        const setting = await new SharedPreferences().get("linovelib_reader_compact");
+        if (setting !== undefined && setting !== null) enabled = String(setting);
+      }
+    } catch (_) {}
+    this._compactReaderEnabled = enabled !== "off";
+  }
+
+  compactReaderHtml(html) {
+    let original = String(html || "");
+    if (this._compactReaderEnabled === false) return original;
+    // Never strip custom-font wrappers: the Linovelib website sometimes
+    // renders private-use characters using a downloadable font. Likewise,
+    // leave annotated (ruby) text intact.
+    const unsafeToUnwrap = /[\uE000-\uF8FF]|<ruby\b|<math\b|<svg\b/i.test(original);
+    let compact = original.replace(/<!--[\s\S]*?-->/g, "");
+    if (!unsafeToUnwrap) {
+      // Remove decorative span/font containers, NOT their content. All image,
+      // picture, a[href], ruby, emphasis and heading tags stay in place.
+      compact = compact.replace(/<\/?(?:span|font)\b[^>]*>/gi, "");
+    }
+    // Split only unusually long *plain text* paragraphs. For paragraphs
+    // with inline tags/images, leave their tree untouched to prevent damage.
+    // Preserve code points, entities and original punctuation byte for byte.
+    compact = compact.replace(/<p\b([^>]*)>([^<>]{850,})<\/p>/gi, (whole, attributes, text) => {
+      if (/[\uE000-\uF8FF]/.test(text)) return whole;
+      const pieces = [];
+      let rest = text;
+      while (rest.length > 660 && pieces.length < 80) {
+        let cut = 520;
+        // Prefer splitting AFTER existing full stops/sentence endings,
+        // retaining punctuation, indentation and spaces exactly.
+        for (let pos = Math.min(rest.length - 1, 640); pos >= 380; pos--) {
+          if (/[。！？!?；;…]/.test(rest[pos])) { cut = pos + 1; break; }
+        }
+        // Do not bisect a surrogate pair or an HTML character reference.
+        const previous = rest.charCodeAt(cut - 1);
+        if (previous >= 0xD800 && previous <= 0xDBFF) cut++;
+        const amp = rest.lastIndexOf("&", cut - 1);
+        const semi = rest.lastIndexOf(";", cut - 1);
+        if (amp > semi && cut - amp <= 32) {
+          const closing = rest.indexOf(";", cut);
+          if (closing >= 0 && closing - cut <= 32) cut = closing + 1;
+        }
+        pieces.push(rest.slice(0, cut));
+        rest = rest.slice(cut);
+      }
+      if (!pieces.length) return whole;
+      pieces.push(rest);
+      return pieces.map(chunk => "<p" + attributes + ">" + chunk + "</p>").join("");
+    });
+    return compact;
+  }
+
   normalizeImageTags(html, chapterUrl) {
     // Preserve original image HTML, including picture/source, lazy attributes,
     // title/alt/size and surrounding figure captions.
@@ -976,7 +1039,7 @@ class DefaultExtension extends MProvider {
         return p;
       });
     }
-    return this.normalizeImageTags(s, chapterUrl).trim();
+    return this.compactReaderHtml(this.normalizeImageTags(s, chapterUrl).trim());
   }
 
   pageBase(path) {
@@ -1431,6 +1494,7 @@ class DefaultExtension extends MProvider {
   }
 
   async getHtmlContent(name, url) {
+    await this.readCompactReaderPreference();
     const limit = this.maxPagesPerChapter(url);
     const resume = await this.readResume(url);
     let currentUrl = resume?.next || url;
@@ -1518,6 +1582,15 @@ class DefaultExtension extends MProvider {
   getFilterList() { return []; }
   getSourcePreferences() {
     return [{
+      key: "linovelib_reader_compact",
+      listPreference: {
+        title: "小說 HTML 輕量排版",
+        summary: "預設啟用：保留文字、插圖和重點標籤，精簡裝飾容器及過長的純文字段落，降低極長章節排版負擔。若字體或排版異常可關閉。",
+        valueIndex: 0,
+        entries: ["輕量排版（預設）", "保留原始 HTML"],
+        entryValues: ["on", "off"]
+      }
+    }, {
       key: "linovelib_chapter_pace",
       listPreference: {
         title: "章節分頁抓取間隔（WebView）",
