@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.3",
+  version: "0.2.4",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -114,7 +114,7 @@ class DefaultExtension extends MProvider {
       const canonicalImage = this.canonicalCover(link);
       // Images inside listing cards may be JavaScript placeholders or
       // protected third-party CDN URLs. Prefer the direct book cover path.
-      const imageUrl = canonicalImage || observedImage;
+      const imageUrl = observedImage || canonicalImage;
       results.push({ name, link, imageUrl });
       seen.add(link);
     }
@@ -373,7 +373,13 @@ class DefaultExtension extends MProvider {
           // ~1.5s of stable content, not the old ~2.4s plus HTTP fallback.
           if (stableCount >= 3 && Date.now() - start >= 1100) {
             var next = (window.ReadParams && window.ReadParams.url_next) || "";
-            report({ html: html, next: next, error: "" });
+            report({ html: html, next: next, error: "", diag: {
+              pageImages: best.el.querySelectorAll("img").length,
+              renderedMs: Date.now() - start,
+              imageExamples: Array.prototype.slice.call(best.el.querySelectorAll("img"), 0, 2).map(function(img) {
+                return img.getAttribute("data-src") || img.getAttribute("data-original") || img.currentSrc || img.getAttribute("src") || "";
+              })
+            } });
             return;
           }
         }
@@ -401,7 +407,7 @@ class DefaultExtension extends MProvider {
     }
     const html = this.cleanContent(payload.html, chapterUrl);
     if (!html) throw new Error("Linovelib：背景載入後正文仍為空");
-    return {html, next: this.absolute(payload.next || "", chapterUrl)};
+    return {html, next: this.absolute(payload.next || "", chapterUrl), diag: payload.diag || null};
   }
 
   isChapterContinuation(currentUrl, nextUrl) {
@@ -416,6 +422,7 @@ class DefaultExtension extends MProvider {
     let currentUrl = url;
     const visited = new Set();
     const parts = [];
+    const diagnostics = [];
     for (let page = 0; page < 12; page++) {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
@@ -425,6 +432,7 @@ class DefaultExtension extends MProvider {
       try {
         const rendered = await this.readRenderedChapter(currentUrl);
         html = rendered.html;
+        if (rendered.diag) diagnostics.push(rendered.diag);
         if (this.isChapterContinuation(currentUrl, rendered.next)) next = rendered.next;
       } catch (error) {
         webviewError = error;
@@ -441,7 +449,19 @@ class DefaultExtension extends MProvider {
         }
       }
       parts.push(html);
-      if (!next) return parts.join("\n<hr/>\n");
+      if (!next) {
+        const combined = parts.join("\n<hr/>\n");
+        const tags = (combined.match(/<img\b/gi) || []).length;
+        const d = diagnostics[0] || {};
+        const ms = Number(d.renderedMs) || 0;
+        const pages = parts.length;
+        const pageImages = Number(d.pageImages) || 0;
+        const example = (d.imageExamples || []).find(x => x) || "";
+        const escape = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        const summary = "Linovelib 診斷：" + pages + " 個正文分頁；擷取到 " + tags + " 個 img 標籤；首分頁原始圖片 " + pageImages + " 張；首分頁背景讀取約 " + (ms / 1000).toFixed(1) + " 秒。";
+        const sample = example ? ("<p><small>圖片網址樣本：" + escape(example) + "</small></p>") : "";
+        return combined + '<hr/><p><small>' + escape(summary) + '</small></p>' + sample;
+      }
       currentUrl = next;
     }
     throw new Error("Linovelib：章節超過 12 頁，為避免截斷請檢查分頁");
