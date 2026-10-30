@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.5",
+  version: "0.2.6",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -179,24 +179,117 @@ class DefaultExtension extends MProvider {
 
     const catalogUrl = this.source.baseUrl + "/novel/" + id + "/catalog";
     const catalog = await this.load(catalogUrl);
+    const entries = this.readCatalogEntries(catalog, id, catalogUrl);
+    if (!entries.length) throw new Error("Linovelib：目錄沒有有效章節");
+    await this.resolveVirtualChapters(entries, id);
     const chapters = [];
     const seen = new Set();
-    // Some entries are volume headings without valid chapter URLs.
-    for (const a of catalog.select("a[href]")) {
-      const href = this.absolute(this.attr(a, "href"), catalogUrl);
-      const pat = new RegExp("/novel/" + id + "/[0-9]+(?:_[0-9]+)?\\.html(?:[?#].*)?$");
-      if (!pat.test(href) || seen.has(href)) continue;
-      const chapterName = this.txt(a);
-      if (!chapterName) continue;
-      seen.add(href);
-      chapters.push({ name: chapterName, url: href, dateUpload: null, scanlator: null });
+    for (const entry of entries) {
+      if (!entry.url || seen.has(entry.url)) continue;
+      seen.add(entry.url);
+      chapters.push({name: entry.name, url: entry.url, dateUpload: null, scanlator: null});
     }
-    if (!chapters.length) throw new Error("Linovelib：無法取得完整目錄（可能需要登入或網站結構已改變）");
-    // Site catalogs normally list reading order; do not invent missing chapter numbers.
+    if (!chapters.length) throw new Error("Linovelib：沒有可閱讀的章節網址");
     return {
       name, link: bookUrl, author, artist: "", imageUrl, description,
       genre: genres, status: 5, chapters
     };
+  }
+
+  validChapterUrl(url, bookId) {
+    const value = String(url || "").split(/[?#]/)[0];
+    const re = new RegExp("^https?://[^/]+/novel/" + bookId + "/[0-9]+(?:_[0-9]+)?\\.html$", "i");
+    return re.test(value);
+  }
+
+  chapterStart(url) {
+    return String(url || "").split(/[?#]/)[0].replace(/_\d+\.html$/i, ".html");
+  }
+
+  // Choose chapter elements, not the page navigation/related-book links.
+  readCatalogEntries(doc, bookId, catalogUrl) {
+    const selectors = [
+      "#catelogX .chapter-li:not(.volume-cover)",
+      "#volumes .catalog-volume .jsChapter a",
+      ".catalog-volume .jsChapter a",
+      "a[href]"
+    ];
+    let best = [];
+    for (const selector of selectors) {
+      const entries = [];
+      for (const node of doc.select(selector)) {
+        const a = this.attr(node, "href") ? node : node.selectFirst("a[href]");
+        if (!a) continue;
+        const raw = this.attr(a, "href").trim();
+        const name = this.txt(a);
+        const url = this.absolute(raw, catalogUrl);
+        const virtual = /^javascript:\s*cid\s*\(/i.test(raw);
+        if (!name || (!virtual && !this.validChapterUrl(url, bookId))) continue;
+        entries.push({name, url: virtual ? "" : url, virtual});
+      }
+      if (entries.length > best.length) best = entries;
+    }
+    return best;
+  }
+
+  readNavigationParam(doc, param, pageUrl) {
+    const snippets = [];
+    for (const el of doc.select("script")) snippets.push(String(el.innerHtml || el.text || ""));
+    const body = doc.selectFirst("body");
+    if (body) snippets.push(String(body.innerHtml || ""));
+    const re = new RegExp("\\b" + param + "\\s*:\\s*['\"]([^'\"]+?\\.html(?:[?#][^'\"]*)?)['\"]", "i");
+    for (const snippet of snippets) {
+      const found = snippet.match(re);
+      if (found) return this.absolute(found[1], pageUrl);
+    }
+    return "";
+  }
+
+  chapterTitleKey(text) {
+    return String(text || "").replace(/&nbsp;/gi, " ")
+      .replace(/^[〇○◯●•·\s]+/, "").replace(/[\uFE0E\uFE0F]/g, "")
+      .replace(/[\s　·・,，.。:：'’"“”\-—_()（）\[\]【】「」！？!?]+/g, "")
+      .toLowerCase();
+  }
+
+  // Follow site's previous-chapter navigation from the next real link.
+  // Verify the candidate's #atitle before accepting a formerly virtual entry.
+  async resolveVirtualChapters(entries, bookId) {
+    const virtualCount = entries.filter(x => x.virtual).length;
+    if (!virtualCount || virtualCount > 12) return;
+    const cached = new Map();
+    const loadOnce = async url => {
+      if (!cached.has(url)) cached.set(url, this.load(url).catch(() => null));
+      return cached.get(url);
+    };
+    const used = new Set(entries.filter(x => x.url).map(x => x.url));
+    let budget = 24;
+    for (let i = 0; i < entries.length && budget > 1;) {
+      if (!entries[i].virtual) { i++; continue; }
+      const start = i;
+      while (i < entries.length && entries[i].virtual) i++;
+      const end = i;
+      if (end >= entries.length || !entries[end].url) continue;
+      let rightUrl = entries[end].url;
+      for (let k = end - 1; k >= start && budget > 1; k--) {
+        budget--;
+        const rightDoc = await loadOnce(rightUrl);
+        if (!rightDoc) break;
+        const previous = this.readNavigationParam(rightDoc, "url_previous", rightUrl);
+        const candidate = this.chapterStart(previous);
+        if (!this.validChapterUrl(candidate, bookId) || used.has(candidate) || candidate === rightUrl) break;
+        budget--;
+        const targetDoc = await loadOnce(candidate);
+        if (!targetDoc) break;
+        const title = this.txt(this.first(targetDoc, ["#atitle", "h1"]));
+        if (!this.chapterTitleKey(entries[k].name) ||
+            this.chapterTitleKey(entries[k].name) !== this.chapterTitleKey(title)) break;
+        entries[k].url = candidate;
+        entries[k].virtual = false;
+        used.add(candidate);
+        rightUrl = candidate;
+      }
+    }
   }
 
   // Mangayomi's novel reader requires a real <img src="...">; it does not
@@ -228,13 +321,35 @@ class DefaultExtension extends MProvider {
     });
   }
 
-  cleanContent(html, chapterUrl) {
+  cleanContent(html, chapterUrl, chapterTitle = "") {
     let s = String(html || "");
     s = s.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
     s = s.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
     s = s.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, "");
     s = s.replace(/<ins\b[^>]*>[\s\S]*?<\/ins>/gi, "");
     s = s.replace(/<a\b[^>]*>\s*(?:上一章|下一章|目錄|書頁)\s*<\/a>/gi, "");
+    // Whole-block notices only. Keep all legitimate story paragraphs intact.
+    s = s.replace(/<(p|div|center|small|span)\b[^>]*>([\s\S]*?)<\/\1>/gi, (all, tag, inner) => {
+      if (/<(?:p|div|section|img)\b/i.test(inner)) return all;
+      const text = inner.replace(/<[^>]+>/g, "").replace(/&nbsp;|&#160;/gi, " ")
+        .replace(/\s+/g, "").trim();
+      if (/^下載後請在?24小時內刪除[，,。]?TSDM不負擔任何責任[。！!]*$/i.test(text)) return "";
+      if (/^[〖【]?手機版頁面由於相容性問題暫不支持電腦端閱讀[，,]?請使用手機閱讀[。！!]?[〗】]?$/.test(text)) return "";
+      return all;
+    });
+    // Some illustration pages repeat long publishing-credit paragraphs.
+    // Limit this to illustration chapters to avoid deleting repeated prose.
+    if (/(?:插圖|插画|彩圖|彩图|彩頁|彩页)/.test(chapterTitle)) {
+      const seen = new Set();
+      s = s.replace(/<p\b[^>]*>[\s\S]*?<\/p>/gi, p => {
+        if (/<img\b/i.test(p)) return p;
+        const key = p.replace(/<[^>]+>/g, "").replace(/\s+/g, "").trim();
+        if (key.length < 90) return p;
+        if (seen.has(key)) return "";
+        seen.add(key);
+        return p;
+      });
+    }
     return this.normalizeImageTags(s, chapterUrl).trim();
   }
 
@@ -278,7 +393,7 @@ class DefaultExtension extends MProvider {
         raw = "<p>" + String(el.text).replace(/&/g, "&amp;")
           .replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</p>";
       }
-      const html = this.cleanContent(raw, chapterUrl);
+      const html = this.cleanContent(raw, chapterUrl, this.txt(doc.selectFirst("#atitle")));
       const plain = String(el.text || "").trim();
       // A loading message is not genuine chapter content.
       const failure = /內容加載失敗|内容加载失败|請重載或更換瀏覽器|本章內容正在載入|章节内容不支持该浏览器显示/i;
@@ -373,13 +488,7 @@ class DefaultExtension extends MProvider {
           // ~1.5s of stable content, not the old ~2.4s plus HTTP fallback.
           if (stableCount >= 3 && Date.now() - start >= 1100) {
             var next = (window.ReadParams && window.ReadParams.url_next) || "";
-            report({ html: html, next: next, error: "", diag: {
-              pageImages: best.el.querySelectorAll("img").length,
-              renderedMs: Date.now() - start,
-              imageExamples: Array.prototype.slice.call(best.el.querySelectorAll("img"), 0, 2).map(function(img) {
-                return img.getAttribute("data-src") || img.getAttribute("data-original") || img.currentSrc || img.getAttribute("src") || "";
-              })
-            } });
+            report({ html: html, next: next, title: (document.querySelector("#atitle") || {}).textContent || "", error: "" });
             return;
           }
         }
@@ -405,90 +514,9 @@ class DefaultExtension extends MProvider {
     if (!payload || !payload.html) {
       throw new Error("Linovelib：背景載入沒有取得完整正文（" + String(payload?.error || "no_result") + "）");
     }
-    const html = this.cleanContent(payload.html, chapterUrl);
+    const html = this.cleanContent(payload.html, chapterUrl, payload.title || "");
     if (!html) throw new Error("Linovelib：背景載入後正文仍為空");
-    return {html, next: this.absolute(payload.next || "", chapterUrl), diag: payload.diag || null};
-  }
-
-  // Experimental: use Mangayomi's existing loopback HLS streaming bridge
-  // for image *bytes*. The current implementation forwards binary unchanged
-  // when the proxy URL uses /key.bin rather than /playlist.m3u8.
-  // This is undocumented for images and may not work with every app version.
-  imageUrlBase64(value) {
-    const utf8 = encodeURIComponent(String(value)).replace(/%([0-9A-F]{2})/g,
-      (_, code) => String.fromCharCode(parseInt(code, 16)));
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let result = "";
-    for (let i = 0; i < utf8.length; i += 3) {
-      const a = utf8.charCodeAt(i);
-      const b = i + 1 < utf8.length ? utf8.charCodeAt(i + 1) : -1;
-      const c = i + 2 < utf8.length ? utf8.charCodeAt(i + 2) : -1;
-      result += alphabet[a >> 2];
-      result += alphabet[((a & 3) << 4) | (b < 0 ? 0 : b >> 4)];
-      if (b >= 0) result += alphabet[((b & 15) << 2) | (c < 0 ? 0 : c >> 6)];
-      if (c >= 0) result += alphabet[c & 63];
-    }
-    return result;
-  }
-
-  // A proxy session's Referer is shared by all images within one chapter.
-  // Create ONE session per chapter rather than expiring sessions every 16 images.
-  async imageProxySession(url, referer) {
-    const userAgent = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/135.0.0.0 Mobile Safari/537.36";
-    const headers = {
-      "User-Agent": userAgent,
-      "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-    };
-    if (referer) headers["Referer"] = referer;
-    const original = await createHlsProxyUrl(url, headers);
-    const match = String(original).match(/^(http:\/\/(?:127\.0\.0\.1|localhost):\d+\/[^/?]+\/)playlist\.m3u8\?/);
-    if (!match) throw new Error("本機代理格式不符合預期");
-    return match[1] + "key.bin?url=";
-  }
-
-  async proxyChapterImages(html) {
-    let images = [];
-    const re = /<img\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1[^>]*>/gi;
-    let match;
-    while ((match = re.exec(html)) !== null) {
-      const src = match[2].replace(/&amp;/g, "&");
-      if (/^https:\/\/(?:[a-z0-9-]+\.)?readpai\.com\//i.test(src)) images.push(src);
-    }
-    images = [...new Set(images)];
-    if (!images.length) return { html, info: "本章沒有 readpai 圖片" };
-    if (typeof createHlsProxyUrl !== "function") {
-      return { html, info: "本機圖片代理介面不存在；仍使用原始圖片網址（" + images.length + " 張）" };
-    }
-
-    try {
-      // The reference host used by a separate public Linovelib reader's image downloader.
-      const base = await this.imageProxySession(images[0], "https://www.bilinovel.com/");
-      const mappings = {};
-      for (const imageUrl of images) mappings[imageUrl] = base + this.imageUrlBase64(imageUrl);
-      const converted = html.replace(re, (tag, quote, encoded) => {
-        const raw = encoded.replace(/&amp;/g, "&");
-        if (!mappings[raw]) return tag;
-        return tag.replace(/\bsrc\s*=\s*(["'])(.*?)\1/i,
-          'src="' + mappings[raw].replace(/&/g, "&amp;") + '"');
-      });
-      let testHtml = "";
-      // Only one image per mode for troubleshooting Referer policies.
-      try {
-        const tw = await this.imageProxySession(images[0], "https://tw.linovelib.com/");
-        const noRef = await this.imageProxySession(images[0], "");
-        const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-        testHtml = '<hr/><p><strong>Linovelib 圖片代理測試</strong></p>' +
-          '<p>方案 A：bilinovel Referer（上方全文圖片已使用）</p>' +
-          '<p>方案 B：linovelib Referer</p><img src="' + esc(tw + this.imageUrlBase64(images[0])) + '" />' +
-          '<p>方案 C：沒有 Referer</p><img src="' + esc(noRef + this.imageUrlBase64(images[0])) + '" />';
-      } catch (_) {
-        testHtml = '<p>無法建立額外的 Referer 對照組。</p>';
-      }
-      return { html: converted + testHtml,
-        info: "已用本機串流代理處理 " + images.length + " 張圖片（方案 A）。代理網址為暫時性，不適合長期離線儲存。" };
-    } catch (e) {
-      return { html, info: "本機代理建立失敗，保留原網址：" + String(e) };
-    }
+    return {html, next: this.absolute(payload.next || "", chapterUrl)};
   }
 
   isChapterContinuation(currentUrl, nextUrl) {
@@ -503,7 +531,6 @@ class DefaultExtension extends MProvider {
     let currentUrl = url;
     const visited = new Set();
     const parts = [];
-    const diagnostics = [];
     for (let page = 0; page < 12; page++) {
       if (visited.has(currentUrl)) throw new Error("Linovelib：偵測到重複的章節分頁");
       visited.add(currentUrl);
@@ -513,7 +540,6 @@ class DefaultExtension extends MProvider {
       try {
         const rendered = await this.readRenderedChapter(currentUrl);
         html = rendered.html;
-        if (rendered.diag) diagnostics.push(rendered.diag);
         if (this.isChapterContinuation(currentUrl, rendered.next)) next = rendered.next;
       } catch (error) {
         webviewError = error;
@@ -530,21 +556,7 @@ class DefaultExtension extends MProvider {
         }
       }
       parts.push(html);
-      if (!next) {
-        const combined = parts.join("\n<hr/>\n");
-        const tags = (combined.match(/<img\b/gi) || []).length;
-        const d = diagnostics[0] || {};
-        const ms = Number(d.renderedMs) || 0;
-        const pages = parts.length;
-        const pageImages = Number(d.pageImages) || 0;
-        const example = (d.imageExamples || []).find(x => x) || "";
-        const escape = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-        const summary = "Linovelib 診斷：" + pages + " 個正文分頁；擷取到 " + tags + " 個 img 標籤；首分頁原始圖片 " + pageImages + " 張；首分頁背景讀取約 " + (ms / 1000).toFixed(1) + " 秒。";
-        const sample = example ? ("<p><small>圖片網址樣本：" + escape(example) + "</small></p>") : "";
-        const proxied = await this.proxyChapterImages(combined);
-        return proxied.html + '<hr/><p><small>' + escape(summary) + '</small></p>' + sample +
-          '<p><small>' + escape(proxied.info) + '</small></p>';
-      }
+      if (!next) return parts.join("\n<hr/>\n");
       currentUrl = next;
     }
     throw new Error("Linovelib：章節超過 12 頁，為避免截斷請檢查分頁");
