@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.11",
+  version: "0.2.12",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -291,7 +291,7 @@ class DefaultExtension extends MProvider {
   // the original query shown to the user. This is not full OpenCC conversion.
   simplifyCommonSearchChars(word) {
     const pairs = {
-      "轉":"转", "實":"实", "歡":"欢", "來":"来", "級":"级", "輕":"轻", "說":"说",
+      "詭":"诡", "謎":"谜", "靈":"灵", "懸":"悬", "驚":"惊", "嚇":"吓", "謊":"谎", "偵":"侦", "諜":"谍", "祕":"秘", "隱":"隐", "歡":"欢", "轉":"转", "實":"实", "來":"来", "級":"级", "輕":"轻", "說":"说",
       "異":"异", "夢":"梦", "劍":"剑", "龍":"龙", "書":"书", "學":"学", "職":"职",
       "國":"国", "為":"为", "開":"开", "覺":"觉", "戀":"恋", "愛":"爱", "貓":"猫",
       "關":"关", "於":"于", "這":"这", "個":"个", "現":"现", "樣":"样", "遊":"游",
@@ -476,61 +476,69 @@ class DefaultExtension extends MProvider {
     return results;
   }
 
-  // Search accessible catalogue pages by title; results are incomplete since
-  // these pages cover only a small portion of the site's full library.
+  // Public catalogue search remains deliberately bounded. The official
+  // keyword-search endpoint requires a server-issued ticket that this source
+  // cannot always obtain. A missing match below is NOT a whole-site no-match.
   async searchPublicTitles(keyword) {
     const urls=[];
     const base=this.source.baseUrl;
-    for (let n=1;n<=5;n++) urls.push(base + "/wenku/lastupdate_0_0_0_0_0_0_0_" + n + "_0.html");
-    for (let n=1;n<=2;n++) urls.push(base + "/wenku/allvisit_0_0_0_0_0_0_0_" + n + "_0.html");
+    // Read additional published catalogue pages, not guessed book IDs.
+    for(let n=1;n<=10;n++) urls.push(base + "/wenku/lastupdate_0_0_0_0_0_0_0_" + n + "_0.html");
+    for(let n=1;n<=5;n++) urls.push(base + "/wenku/allvisit_0_0_0_0_0_0_0_" + n + "_0.html");
     if (/^(轉生|转生)$/.test(keyword)) {
       for(let n=1;n<=3;n++) urls.push(base + "/wenku/lastupdate_26_0_0_0_0_0_0_" + n + "_0.html");
     }
     const out=[], seen=new Set();
-    // Keep requests bounded (and below the isolate timeout). Failures from a
-    // guarded/public page do not mean the query has no matches on the site.
-    const groups=[];
-    for(let i=0;i<urls.length;i+=4) groups.push(urls.slice(i,i+4));
-    for(const group of groups) {
-      const result=await Promise.allSettled(group.map(async url => {
+    let reachablePages=0, checkedTitles=0;
+    // Bounded concurrency to avoid overwhelming the website and to fit
+    // Mangayomi's per-search timeout. No unbounded archive crawl.
+    for(let i=0;i<urls.length;i+=6) {
+      const results=await Promise.allSettled(urls.slice(i,i+6).map(async url => {
         const doc=await this.load(url);
         return this.listFromPage(doc,url,false).list;
       }));
-      for(const entry of result) {
-        if(entry.status!=="fulfilled") continue;
-        for(const item of entry.value) {
+      for(const result of results) {
+        if(result.status!=="fulfilled" || !Array.isArray(result.value) || result.value.length===0) continue;
+        reachablePages++;
+        checkedTitles+=result.value.length;
+        for(const item of result.value) {
           if(!this.titleMatchesQuery(item.name,keyword) || seen.has(item.link)) continue;
           seen.add(item.link);
           out.push(item);
         }
       }
     }
-    return out;
+    return {list:out,reachablePages,checkedTitles};
   }
 
   async search(query, page, filters) {
     const word=String(query ?? "").trim();
-    if (!word || page<1) return this.blank();
+    if(!word || page<1) return this.blank();
     const id=this.searchBookId(word);
-    if (id) return page>1 ? this.blank() : {list:await this.searchByBookId(id),hasNextPage:false};
-    // Only page one is implemented; claiming further pages would imply
-    // comprehensive search that the restricted site does not provide.
-    if (page>1) return this.blank();
+    if(id) return page>1 ? this.blank() : {list:await this.searchByBookId(id),hasNextPage:false};
+    if(page>1) return this.blank();
     const [publicResult,cseResult]=await Promise.allSettled([
       this.searchPublicTitles(word),this.searchViaCse(word)
     ]);
     const combined=[], seen=new Set();
-    for (const r of [cseResult,publicResult]) {
-      if (r.status!=="fulfilled") continue;
-      for(const item of r.value) {
+    const append=(items)=>{
+      for(const item of items || []) {
         if(!this.titleMatchesQuery(item.name,word) || seen.has(item.link)) continue;
         seen.add(item.link);
         combined.push(item);
       }
-    }
-    if (combined.length) return {list:combined.slice(0,45),hasNextPage:false};
-    throw new Error("Linovelib v0.2.11：目前未從 Google 自訂搜尋或有限範圍的公開書庫找到符合書名的作品。" +
-      "這不是全站搜尋結果，無法判定該書不存在；可改用書籍 ID 查詢。" +
+    };
+    if(cseResult.status==="fulfilled") append(cseResult.value);
+    if(publicResult.status==="fulfilled") append(publicResult.value.list);
+    if(combined.length) return {list:combined.slice(0,45),hasNextPage:false};
+    // If the public catalogue was accessible, this is a genuine NO MATCH
+    // in the sampled pages. Show normal 'No result' instead of a scary error.
+    // The extension notes explain that coverage is not all-site search.
+    if(publicResult.status==="fulfilled" && publicResult.value.reachablePages>0) return this.blank();
+    // No search source worked: do NOT falsely report that the book is absent.
+    throw new Error("Linovelib v0.2.12：搜尋來源無法存取，無法判定書名是否存在。" +
+      "可改用書籍 ID 查詢；網站完整搜尋須有正常核發的搜尋票證。" +
+      (publicResult.status==="rejected" ? " 公開書庫："+String(publicResult.reason) : "") +
       (cseResult.status==="rejected" ? " CSE："+String(cseResult.reason) : ""));
   }
 

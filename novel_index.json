@@ -32,15 +32,15 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.11",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.12",
     "apiUrl": "",
-    "version": "0.2.11",
+    "version": "0.2.12",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.11: novel title matching via user-supplied Legado Google CSE and bounded public catalogue pages; filter tag-category matches; preserve chapter order and content; no guaranteed full-site search"
+    "notes": "v0.2.12: fix 詭/诡 title normalization, expand bounded public title matching (10 latest + 5 popular pages), show No result instead of exception when sampled catalogues have no title matches; not full-site search; preserve existing book/chapter URLs and reader logic"
   }
 ]
