@@ -34,13 +34,13 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
     "apiUrl": "",
-    "version": "0.2.4",
+    "version": "0.2.5",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "DIAGNOSTIC v0.2.4: cover selection and chapter image diagnostics; temporary"
+    "notes": "Experimental local image proxy with Referer test variants. Temporary proxy URLs are not suitable for persistent offline downloads."
   }
 ]

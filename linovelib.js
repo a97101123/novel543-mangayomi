@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.4",
+  version: "0.2.5",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -410,6 +410,87 @@ class DefaultExtension extends MProvider {
     return {html, next: this.absolute(payload.next || "", chapterUrl), diag: payload.diag || null};
   }
 
+  // Experimental: use Mangayomi's existing loopback HLS streaming bridge
+  // for image *bytes*. The current implementation forwards binary unchanged
+  // when the proxy URL uses /key.bin rather than /playlist.m3u8.
+  // This is undocumented for images and may not work with every app version.
+  imageUrlBase64(value) {
+    const utf8 = encodeURIComponent(String(value)).replace(/%([0-9A-F]{2})/g,
+      (_, code) => String.fromCharCode(parseInt(code, 16)));
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let result = "";
+    for (let i = 0; i < utf8.length; i += 3) {
+      const a = utf8.charCodeAt(i);
+      const b = i + 1 < utf8.length ? utf8.charCodeAt(i + 1) : -1;
+      const c = i + 2 < utf8.length ? utf8.charCodeAt(i + 2) : -1;
+      result += alphabet[a >> 2];
+      result += alphabet[((a & 3) << 4) | (b < 0 ? 0 : b >> 4)];
+      if (b >= 0) result += alphabet[((b & 15) << 2) | (c < 0 ? 0 : c >> 6)];
+      if (c >= 0) result += alphabet[c & 63];
+    }
+    return result;
+  }
+
+  // A proxy session's Referer is shared by all images within one chapter.
+  // Create ONE session per chapter rather than expiring sessions every 16 images.
+  async imageProxySession(url, referer) {
+    const userAgent = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/135.0.0.0 Mobile Safari/537.36";
+    const headers = {
+      "User-Agent": userAgent,
+      "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    };
+    if (referer) headers["Referer"] = referer;
+    const original = await createHlsProxyUrl(url, headers);
+    const match = String(original).match(/^(http:\/\/(?:127\.0\.0\.1|localhost):\d+\/[^/?]+\/)playlist\.m3u8\?/);
+    if (!match) throw new Error("本機代理格式不符合預期");
+    return match[1] + "key.bin?url=";
+  }
+
+  async proxyChapterImages(html) {
+    let images = [];
+    const re = /<img\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1[^>]*>/gi;
+    let match;
+    while ((match = re.exec(html)) !== null) {
+      const src = match[2].replace(/&amp;/g, "&");
+      if (/^https:\/\/(?:[a-z0-9-]+\.)?readpai\.com\//i.test(src)) images.push(src);
+    }
+    images = [...new Set(images)];
+    if (!images.length) return { html, info: "本章沒有 readpai 圖片" };
+    if (typeof createHlsProxyUrl !== "function") {
+      return { html, info: "本機圖片代理介面不存在；仍使用原始圖片網址（" + images.length + " 張）" };
+    }
+
+    try {
+      // The reference host used by a separate public Linovelib reader's image downloader.
+      const base = await this.imageProxySession(images[0], "https://www.bilinovel.com/");
+      const mappings = {};
+      for (const imageUrl of images) mappings[imageUrl] = base + this.imageUrlBase64(imageUrl);
+      const converted = html.replace(re, (tag, quote, encoded) => {
+        const raw = encoded.replace(/&amp;/g, "&");
+        if (!mappings[raw]) return tag;
+        return tag.replace(/\bsrc\s*=\s*(["'])(.*?)\1/i,
+          'src="' + mappings[raw].replace(/&/g, "&amp;") + '"');
+      });
+      let testHtml = "";
+      // Only one image per mode for troubleshooting Referer policies.
+      try {
+        const tw = await this.imageProxySession(images[0], "https://tw.linovelib.com/");
+        const noRef = await this.imageProxySession(images[0], "");
+        const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+        testHtml = '<hr/><p><strong>Linovelib 圖片代理測試</strong></p>' +
+          '<p>方案 A：bilinovel Referer（上方全文圖片已使用）</p>' +
+          '<p>方案 B：linovelib Referer</p><img src="' + esc(tw + this.imageUrlBase64(images[0])) + '" />' +
+          '<p>方案 C：沒有 Referer</p><img src="' + esc(noRef + this.imageUrlBase64(images[0])) + '" />';
+      } catch (_) {
+        testHtml = '<p>無法建立額外的 Referer 對照組。</p>';
+      }
+      return { html: converted + testHtml,
+        info: "已用本機串流代理處理 " + images.length + " 張圖片（方案 A）。代理網址為暫時性，不適合長期離線儲存。" };
+    } catch (e) {
+      return { html, info: "本機代理建立失敗，保留原網址：" + String(e) };
+    }
+  }
+
   isChapterContinuation(currentUrl, nextUrl) {
     const current = String(currentUrl || "").split(/[?#]/)[0];
     const next = String(nextUrl || "").split(/[?#]/)[0];
@@ -460,7 +541,9 @@ class DefaultExtension extends MProvider {
         const escape = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
         const summary = "Linovelib 診斷：" + pages + " 個正文分頁；擷取到 " + tags + " 個 img 標籤；首分頁原始圖片 " + pageImages + " 張；首分頁背景讀取約 " + (ms / 1000).toFixed(1) + " 秒。";
         const sample = example ? ("<p><small>圖片網址樣本：" + escape(example) + "</small></p>") : "";
-        return combined + '<hr/><p><small>' + escape(summary) + '</small></p>' + sample;
+        const proxied = await this.proxyChapterImages(combined);
+        return proxied.html + '<hr/><p><small>' + escape(summary) + '</small></p>' + sample +
+          '<p><small>' + escape(proxied.info) + '</small></p>';
       }
       currentUrl = next;
     }
