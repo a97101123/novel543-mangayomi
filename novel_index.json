@@ -10,16 +10,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js?v=0.3.2",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js?v=0.3.4",
     "apiUrl": "",
-    "version": "0.3.2",
+    "version": "0.3.4",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "Image-HTML preservation; retain original chapter IDs and URLs. No reader-app image-renderer change."
+    "notes": "v0.3.4 beta: validate requested multipart page by page title and full-text fingerprint; tolerate stale (1/2) marker on a distinct verified page two; preserve chapter URLs and images"
   },
   {
     "name": "嗶哩輕小說（繁體）",
@@ -32,16 +32,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.18",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.19",
     "apiUrl": "",
-    "version": "0.2.18",
+    "version": "0.2.19",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.18 beta: verified continuation up to 128 subpages; remember working HTTP/WebView reading mode to avoid duplicate requests; stop on 429; prevent truncated content; original book/chapter URLs unchanged."
+    "notes": "v0.2.19 beta: cache verified completed parts only on interrupted long chapter; resume after server 429 without refetching prior pages; no rate-limit bypass; cache expires 48h; preserve catalog ordering and images"
   },
   {
     "name": "真白萌 Masiro（需登入）",

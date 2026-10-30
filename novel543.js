@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://www.novel543.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.3",
+  version: "0.3.4",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -310,21 +310,28 @@ class DefaultExtension extends MProvider {
     result = result.replace(/<a\b[^>]*>\s*(上一章|下一章|目錄|回到頂部)\s*<\/a>/gi, "");
     return this.preserveReaderImages(result, pageUrl).trim();
   }
-  // A page marker can be in H1, chapter heading or the document title.
-  // Missing marker is UNKNOWN, not evidence that the page is "1/1".
+  // Prefer the primary H1 when more than one page counter is rendered.
+  // Several Novel543 templates keep an out-of-date "(1/2)" label in a
+  // secondary heading even when the actual requested subpage differs.
   getPageInfo(doc) {
-    for (const selector of [".chapter-title", ".read-title", ".chapter_title", "h1", "title"]) {
+    let fallback = null;
+    for (const selector of ["h1", ".chapter-title", ".read-title", ".chapter_title", "title"]) {
       for (const el of doc.select(selector)) {
-        const title = String(el?.text || "");
+        const heading = String(el?.text || "").trim();
         const pattern = /[（(]\s*(\d+)\s*[/／]\s*(\d+)\s*[)）]/g;
         let match, last = null;
-        while ((match = pattern.exec(title)) !== null) last = match;
+        while ((match = pattern.exec(heading)) !== null) last = match;
         if (!last) continue;
         const current = Number(last[1]), total = Number(last[2]);
-        if (current >= 1 && total >= current) return {current, total, explicit:true};
+        if (!Number.isSafeInteger(current) || !Number.isSafeInteger(total) || current < 1 || total < current) continue;
+        const titleKey = heading.replace(/[（(]\s*\d+\s*[/／]\s*\d+\s*[)）]/g, "")
+          .replace(/\s+/g, "").trim().toLowerCase();
+        const candidate = {current, total, titleKey, explicit:true, source:selector};
+        if (selector === "h1") return candidate;
+        if (!fallback) fallback = candidate;
       }
     }
-    return {current:null, total:null, explicit:false};
+    return fallback || {current:null, total:null, titleKey:"", explicit:false, source:""};
   }
 
   getContent(doc, pageUrl) {
@@ -345,9 +352,30 @@ class DefaultExtension extends MProvider {
   }
 
   pageSignature(html) {
-    // Only for duplicate detection; it never removes any actual prose.
-    return String(html || "").replace(/<[^>]+>/g, "").replace(/&nbsp;|&#160;/gi, " ")
-      .replace(/\s+/g, "").trim().slice(0, 1600);
+    // Hash the entire normalised text, rather than the first 1600 characters:
+    // adjacent chapter pages may intentionally share an introductory paragraph.
+    const plain = String(html || "").replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;|&#160;/gi, " ").replace(/\s+/g, "").trim();
+    let hash = 2166136261;
+    for (let i = 0; i < plain.length; i++) {
+      hash ^= plain.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return plain.length + ":" + (hash >>> 0).toString(16);
+  }
+
+  // The requested URL and unique chapter text are more reliable than a stale
+  // secondary counter. Accept ONLY a 1/total label on requested page two,
+  // with a matching chapter heading and content distinct from page one.
+  // Never accept a different chapter title, an empty page, or repeated text.
+  canAcceptStaleSecondPage(firstInfo, secondInfo, page, total, url, html, signatures) {
+    if (page !== 2 || !firstInfo.explicit || !secondInfo.explicit) return false;
+    if (firstInfo.current !== 1 || secondInfo.current !== 1) return false;
+    if (secondInfo.total !== total || firstInfo.total !== total) return false;
+    if (!firstInfo.titleKey || !secondInfo.titleKey || firstInfo.titleKey !== secondInfo.titleKey) return false;
+    if (!/_2\.html(?:[?#].*)?$/i.test(String(url || ""))) return false;
+    if (html.replace(/<[^>]*>/g, "").replace(/\s+/g, "").trim().length < 100) return false;
+    return !signatures.has(this.pageSignature(html));
   }
 
   async getHtmlContent(name, url) {
@@ -377,16 +405,17 @@ class DefaultExtension extends MProvider {
       }
 
       const pageInfo = this.getPageInfo(nextDoc);
-      // Only reject genuinely contradictory labels. A missing (2/2)
-      // indicator is not itself an error if the page and content are valid.
-      if (pageInfo.explicit && pageInfo.current !== page)
-        throw new Error("Novel543：第 " + page + " 頁的標記實際是 " +
-          pageInfo.current + "/" + pageInfo.total + "，已停止避免混入錯誤內容");
-
       const html = this.getContent(nextDoc, nextUrl);
       const signature = this.pageSignature(html);
       if (signature && signatures.has(signature))
-        throw new Error("Novel543：第 " + page + " 頁和先前內容重複，網站可能回傳錯誤分頁");
+        throw new Error("Novel543：第 " + page + " 頁和先前內容重複，網站可能回傳了第一頁或錯誤分頁");
+      if (pageInfo.explicit && pageInfo.current !== page &&
+          !this.canAcceptStaleSecondPage(info, pageInfo, page, total, nextUrl, html, signatures))
+        throw new Error("Novel543：第 " + page + " 頁的標記實際是 " +
+          pageInfo.current + "/" + pageInfo.total + "，且無法驗證為正確分頁；已停止避免混入錯誤內容");
+      if (pageInfo.explicit && info.titleKey && pageInfo.titleKey &&
+          info.titleKey !== pageInfo.titleKey)
+        throw new Error("Novel543：第 " + page + " 頁標題與第一頁不同，已停止避免混入其他章節");
       if (signature) signatures.add(signature);
       parts.push(html);
 

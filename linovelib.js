@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.18",
+  version: "0.2.19",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -1250,26 +1250,87 @@ class DefaultExtension extends MProvider {
     return /(?:HTTP\s*429|rate_limited|限制請求頻率|請求過於頻繁|Too Many Requests)/i.test(String(error || ""));
   }
 
+  // A 429 at page 12 should not force a new attempt to re-download pages
+  // 1–11. Store verified pages only AFTER an interrupted read. This is
+  // ordinary source preference storage, not a server-side cache or an auth
+  // token. The record expires after 48 hours and is bounded to 1 MB.
+  resumeKey(url) {
+    const m = String(url || "").match(/\/novel\/(\d+)\/(\d+)(?:_\d+)?\.html(?:[?#]|$)/i);
+    return m ? "linovelib_verified_resume_v019_" + m[1] + "_" + m[2] : "";
+  }
+
+  async readResume(url) {
+    const key = this.resumeKey(url);
+    if (!key) return null;
+    let raw = "";
+    try {
+      if (typeof SharedPreferences !== "undefined") {
+        raw = await new SharedPreferences().getString(key, "");
+      }
+      if (!raw && this._ephemeralResume && this._ephemeralResume.key === key)
+        raw = this._ephemeralResume.raw;
+      if (!raw) return null;
+      const value = JSON.parse(String(raw));
+      if (!value || value.version !== 1 || value.start !== url ||
+          Date.now() - value.savedAt > 48 * 60 * 60 * 1000 ||
+          !Array.isArray(value.parts) || !Array.isArray(value.urls) ||
+          value.parts.length !== value.urls.length ||
+          value.parts.length < 1 || value.parts.length >= this.maxPagesPerChapter(url) ||
+          value.urls[0] !== url || typeof value.next !== "string") return null;
+      if (!value.parts.every(p => typeof p === "string" && p.length > 20)) return null;
+      for (let i=1; i<value.urls.length; i++) {
+        if (!this.isChapterContinuation(value.urls[i-1], value.urls[i])) return null;
+      }
+      if (!this.isChapterContinuation(value.urls[value.urls.length-1], value.next)) return null;
+      return value;
+    } catch (_) { return null; }
+  }
+
+  async saveResume(url, parts, urls, next, preferred) {
+    const key = this.resumeKey(url);
+    if (!key || !parts.length || !next || !this.isChapterContinuation(urls[urls.length-1], next)) return false;
+    const data = {
+      version:1, start:url, savedAt:Date.now(), parts:parts.slice(),
+      urls:urls.slice(), next, preferred
+    };
+    const raw = JSON.stringify(data);
+    if (raw.length > 1000000) return false;
+    this._ephemeralResume = {key, raw};
+    try {
+      if (typeof SharedPreferences !== "undefined") {
+        await new SharedPreferences().setString(key, raw);
+      }
+    } catch (_) { return true; } // The in-memory copy remains usable.
+    return true;
+  }
+
+  async clearResume(url) {
+    const key = this.resumeKey(url);
+    if (this._ephemeralResume?.key === key) this._ephemeralResume = null;
+    if (!key) return;
+    try {
+      if (typeof SharedPreferences !== "undefined")
+        await new SharedPreferences().setString(key, "");
+    } catch (_) {}
+  }
+
   async getHtmlContent(name, url) {
-    let currentUrl = url;
-    const visited = new Set();
-    const parts = [];
     const limit = this.maxPagesPerChapter(url);
-    // If HTTP could not get readable content but WebView could, use the
-    // browser FIRST on subsequent pages: this avoids a wasted HTTP request
-    // for every part of a very long chapter. No parallel/automatic prefetch.
-    let preferred = "http";
-    for (let page = 1; page <= limit; page++) {
+    const resume = await this.readResume(url);
+    let currentUrl = resume?.next || url;
+    const parts = resume ? resume.parts.slice() : [];
+    const pageUrls = resume ? resume.urls.slice() : [];
+    const visited = new Set(pageUrls);
+    let preferred = resume?.preferred === "browser" ? "browser" : "http";
+    for (let page = parts.length + 1; page <= limit; page++) {
       if (visited.has(currentUrl))
         throw new Error("Linovelib：章節分頁循環，第 " + page + " 頁（" + currentUrl + "）");
       visited.add(currentUrl);
       let html = "", next = "", httpError = null, browserError = null;
-
       const tryHttp = async () => {
         try {
           const doc = await this.loadChapterOnce(currentUrl);
           const parsed = this.readHttpChapter(doc, currentUrl);
-          // Validate before accepting content; never return truncated prose.
           next = this.checkedContinuation(currentUrl, parsed.next);
           html = parsed.html;
           preferred = "http";
@@ -1289,7 +1350,6 @@ class DefaultExtension extends MProvider {
           browserError = e;
         }
       };
-
       try {
         if (preferred === "browser") {
           await tryBrowser();
@@ -1299,24 +1359,30 @@ class DefaultExtension extends MProvider {
           if (!html) await tryBrowser();
         }
       } catch (error) {
-        // 429 is a server-enforced limit: stop immediately, do not send a
-        // second request through a different transport and worsen the block.
         if (this.isRateLimitFailure(error)) {
-          throw new Error("Linovelib：讀取第 " + page + " 頁遇到 HTTP 429（網站限流）。已停止後續請求；請稍後再試，不要連續按 Retry。" );
+          const saved = await this.saveResume(url, parts, pageUrls, currentUrl, preferred);
+          throw new Error("Linovelib：第 " + page + " 頁遇到 HTTP 429。已停止請求" +
+            (saved ? "；已暫存前 " + parts.length + " 頁，下次將優先從此頁接續" : "；暫存不可用") +
+            "。請等待網站解除限流，不要連續按 Retry。");
         }
         throw new Error("Linovelib：第 " + page + " 頁驗證失敗：" + String(error));
       }
-
       if (!html) {
+        const saved = await this.saveResume(url, parts, pageUrls, currentUrl, preferred);
         throw new Error("Linovelib：第 " + page + " 頁未取得完整內容。HTTP：" +
           String(httpError || "未執行") + "；WebView：" + String(browserError || "未執行") +
-          "。未返回不完整章節。");
+          (saved ? "。先前讀取的分頁已暫存，可在問題解除後接續" : "。未返回不完整章節"));
       }
       parts.push(html);
-      if (!next) return parts.join("\n<hr/>\n");
+      pageUrls.push(currentUrl);
+      if (!next) {
+        await this.clearResume(url);
+        return parts.join("\n<hr/>\n");
+      }
       if (page === limit) {
-        throw new Error("Linovelib：章節已有 " + limit +
-          " 個網站分頁，仍有下一頁。為避免缺頁已停止；這可能超過 Mangayomi 一次讀取的能力。");
+        await this.saveResume(url, parts, pageUrls, next, preferred);
+        throw new Error("Linovelib：章節已讀取 " + limit +
+          " 頁，網站仍有下一頁；暫存進度，但本版安全上限仍為 " + limit + " 頁。");
       }
       currentUrl = next;
     }
