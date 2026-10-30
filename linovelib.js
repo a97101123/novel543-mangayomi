@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.19",
+  version: "0.2.20",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -22,9 +22,89 @@ class DefaultExtension extends MProvider {
     };
   }
 
+  // Rate-limit protection for this source. Mangayomi's embedded JS runtime
+  // does not expose a guaranteed non-blocking sleep API. Therefore we persist
+  // a next-allowed time and reject requests *before* network I/O rather than
+  // spin/sleep inside the reader. A Retry-After from the server always wins.
+  rateGateKey() { return "linovelib_rate_gate_v020"; }
+
+  async readRateGate() {
+    let state = this._rateGateMemory || null;
+    try {
+      if (typeof SharedPreferences !== "undefined") {
+        const raw = await new SharedPreferences().getString(this.rateGateKey(), "");
+        if (raw) {
+          const saved = JSON.parse(String(raw));
+          if (saved && saved.version === 1 && Number.isFinite(saved.until) &&
+              Number.isFinite(saved.last429At) && Number.isInteger(saved.count) &&
+              saved.count >= 0 && saved.count <= 100 &&
+              (!state || saved.last429At > state.last429At ||
+               (saved.last429At === state.last429At && saved.until > state.until))) {
+            state = saved;
+          }
+        }
+      }
+    } catch (_) { /* Keep the in-memory protection when storage is unavailable. */ }
+    return state;
+  }
+
+  async ensureRateAllowed() {
+    const state = await this.readRateGate();
+    if (state && state.until > Date.now()) {
+      const seconds = Math.max(1, Math.ceil((state.until - Date.now()) / 1000));
+      throw new Error("Linovelib：HTTP 429 冷卻中，約 " + seconds +
+        " 秒後才能再次向網站請求。已阻止連線，請勿連續按 Retry。");
+    }
+  }
+
+  // Retry-After is either delta-seconds or an RFC-style HTTP date, and is
+  // optional. Never assume a particular CDN always sends it.
+  parseRetryAfterMs(response, now = Date.now()) {
+    const headers = response?.headers || {};
+    let value = "";
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() !== "retry-after") continue;
+      const raw = headers[key];
+      value = String(Array.isArray(raw) ? raw[0] : raw || "").trim();
+      break;
+    }
+    if (!value) return null;
+    if (/^\d+(?:\.\d+)?$/.test(value)) {
+      const ms = Math.ceil(Number(value) * 1000);
+      return Number.isFinite(ms) && ms >= 0 ? ms : null;
+    }
+    const time = Date.parse(value);
+    return Number.isFinite(time) ? Math.max(0, time - now) : null;
+  }
+
+  async recordRateLimit(response = null) {
+    const now = Date.now();
+    const previous = await this.readRateGate();
+    const count = previous && now - previous.last429At < 6 * 3600000
+      ? Math.min(10, previous.count + 1) : 1;
+    const announced = this.parseRetryAfterMs(response, now);
+    // Missing Retry-After: conservatively back off across *separate user
+    // attempts*: 60s, 120s, 240s, ... capped at 15 min, with 0-10s jitter.
+    // A server-provided Retry-After is not shortened or overridden by jitter.
+    const fallback = Math.min(15 * 60000, 60000 * Math.pow(2, count - 1)) +
+      Math.floor(Math.random() * 10000);
+    const ms = announced === null ? fallback : Math.max(1000, announced);
+    const state = {version:1, count, last429At:now, until:now + ms};
+    this._rateGateMemory = state;
+    try {
+      if (typeof SharedPreferences !== "undefined")
+        await new SharedPreferences().setString(this.rateGateKey(), JSON.stringify(state));
+    } catch (_) { /* In-memory cooldown still applies to this runtime. */ }
+    const seconds = Math.ceil(ms / 1000);
+    throw new Error("Linovelib：HTTP 429，" +
+      (announced !== null ? "依網站 Retry-After" : "依指數退避與隨機抖動") +
+      "進入冷卻，約 " + seconds + " 秒後再試；已停止後續請求。");
+  }
+
   // Adapted reliability pattern: retry one transient network/server error,
   // never retry a 403 challenge or a 429 rate-limit response automatically.
   async load(url) {
+    await this.ensureRateAllowed();
     let lastError = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       let response;
@@ -37,7 +117,7 @@ class DefaultExtension extends MProvider {
       }
       const status = Number(response?.statusCode ?? response?.status ?? 200);
       if ([502, 503, 504].includes(status) && attempt === 0) continue;
-      if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試");
+      if (status === 429) await this.recordRateLimit(response);
       if ([401, 403].includes(status)) throw new Error("Linovelib：網站要求驗證或拒絕存取（HTTP " + status + "）");
       if (status >= 400) throw new Error("Linovelib：網站回應 HTTP " + status);
       const html = String(response?.body || "");
@@ -169,6 +249,7 @@ class DefaultExtension extends MProvider {
   // before HTML is returned (including "127.0.0.1:80 connection refused").
   // Use an ordinary browser-rendered search page first, not fabricated cookies.
   async searchViaBrowser(searchUrl, word) {
+    await this.ensureRateAllowed();
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本沒有背景瀏覽器搜尋功能");
     }
@@ -259,11 +340,13 @@ class DefaultExtension extends MProvider {
   // If both fail, a clearly labelled direct navigation result is returned
   // rather than silently reporting that a user-supplied book ID does not exist.
   async searchByBookId(bookId) {
+    await this.ensureRateAllowed();
     const bookUrl = this.source.baseUrl + "/novel/" + bookId + ".html";
     let firstError = null;
     try {
       const response = await new Client().get(bookUrl, this.getHeaders(bookUrl));
       const status = Number(response?.statusCode ?? response?.status ?? 200);
+      if (status === 429) await this.recordRateLimit(response);
       if (status >= 400 || !response?.body) throw new Error("HTTP " + status);
       const doc = new Document(response.body);
       const name = this.attr(doc.selectFirst('meta[property="og:novel:book_name"]'), "content") ||
@@ -272,7 +355,10 @@ class DefaultExtension extends MProvider {
       const imageUrl = this.absolute(this.attr(doc.selectFirst('meta[property="og:image"]'), "content"), bookUrl) ||
         this.canonicalCover(bookUrl);
       return [{ name, link: bookUrl, imageUrl }];
-    } catch (error) { firstError = error; }
+    } catch (error) {
+      if (this.isRateLimitFailure(error)) throw error;
+      firstError = error;
+    }
     try {
       const list = await this.searchViaBrowser(bookUrl, bookId);
       if (list.length) return list.map(book => ({ ...book, link: bookUrl }));
@@ -500,9 +586,8 @@ class DefaultExtension extends MProvider {
     return results;
   }
 
-  // Respect the site's published request limits. Searching a title is not
-  // permission to crawl dozens of catalogue pages: sample at most eight,
-  // use two concurrent requests, and stop immediately after any HTTP 429.
+  // Keep title lookup bounded and SERIAL: no second catalogue request is
+  // already in flight when the first returns a server rate limit.
   // This is a LIMITED public-title match, not full-site search.
   async searchPublicTitles(keyword) {
     const base = this.source.baseUrl;
@@ -517,11 +602,12 @@ class DefaultExtension extends MProvider {
     }
     const out = [], seen = new Set();
     let reachablePages = 0, checkedTitles = 0, rateLimited = false;
-    for (let i = 0; i < urls.length; i += 2) {
-      const batch = await Promise.allSettled(urls.slice(i, i + 2).map(async url => {
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      const batch = await Promise.allSettled([(async () => {
         const doc = await this.load(url);
         return this.listFromPage(doc, url, false).list;
-      }));
+      })()]);
       for (const entry of batch) {
         if (entry.status !== "fulfilled") {
           if (/\b429\b|限制請求頻率|Too Many Requests/i.test(String(entry.reason))) rateLimited = true;
@@ -1015,9 +1101,10 @@ class DefaultExtension extends MProvider {
   // Chapter HTTP requests get one short attempt. 429 is terminal for this
   // reading action: repeatedly opening more connections makes limits worse.
   async loadChapterOnce(url) {
+    await this.ensureRateAllowed();
     const response = await new Client({timeout: 6}).get(url, this.getHeaders(url));
     const status = Number(response?.statusCode ?? response?.status ?? 0);
-    if (status === 429) throw new Error("Linovelib：網站限制請求頻率（HTTP 429），請稍後再試，勿連續重試");
+    if (status === 429) await this.recordRateLimit(response);
     if (status === 403 || status === 401) throw new Error("Linovelib：網站要求驗證（HTTP " + status + "）");
     if (status >= 400 || !response?.body) throw new Error("Linovelib：HTTP " + status + " 或空白回應");
     const body = String(response.body);
@@ -1031,6 +1118,7 @@ class DefaultExtension extends MProvider {
   // when static HTML cannot be verified. This is a headless WebView, not the
   // manual WebView button. Keep the v0.2.15 stable-content capture behavior.
   async readRenderedChapter(chapterUrl) {
+    await this.ensureRateAllowed();
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
@@ -1206,7 +1294,7 @@ class DefaultExtension extends MProvider {
     catch (_) { throw new Error("Linovelib：背景 WebView 沒有回傳有效 JSON"); }
     if (!payload || !payload.html) {
       const reason = String(payload?.error || "no_result");
-      if (reason === "rate_limited") throw new Error("Linovelib：背景頁面已被限流（HTTP 429），請稍後再試");
+      if (reason === "rate_limited") await this.recordRateLimit(null);
       if (reason === "verification_required") throw new Error("Linovelib：網站要求驗證，請在 WebView 完成驗證");
       throw new Error("Linovelib：背景載入沒有取得完整正文（" + reason + "）");
     }
@@ -1361,7 +1449,7 @@ class DefaultExtension extends MProvider {
       } catch (error) {
         if (this.isRateLimitFailure(error)) {
           const saved = await this.saveResume(url, parts, pageUrls, currentUrl, preferred);
-          throw new Error("Linovelib：第 " + page + " 頁遇到 HTTP 429。已停止請求" +
+          throw new Error("Linovelib：第 " + page + " 頁遇到限流或冷卻保護（HTTP 429）。已停止請求" +
             (saved ? "；已暫存前 " + parts.length + " 頁，下次將優先從此頁接續" : "；暫存不可用") +
             "。請等待網站解除限流，不要連續按 Retry。");
         }
@@ -1375,6 +1463,9 @@ class DefaultExtension extends MProvider {
       }
       parts.push(html);
       pageUrls.push(currentUrl);
+      // Commit the verified part immediately: app termination or a later
+      // 429 should not force the next run to fetch already-read pages.
+      if (next) await this.saveResume(url, parts, pageUrls, next, preferred);
       if (!next) {
         await this.clearResume(url);
         return parts.join("\n<hr/>\n");

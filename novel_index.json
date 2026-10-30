@@ -32,16 +32,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.19",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.20",
     "apiUrl": "",
-    "version": "0.2.19",
+    "version": "0.2.20",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.19 beta: cache verified completed parts only on interrupted long chapter; resume after server 429 without refetching prior pages; no rate-limit bypass; cache expires 48h; preserve catalog ordering and images"
+    "notes": "v0.2.20: honor Retry-After (seconds/date) with persisted cooldown; without header exponential backoff plus jitter across manual attempts; serial public-catalog search; commit verified chapter parts after each page; preserve v0.2.19 resume records. No bypass of HTTP 429."
   },
   {
     "name": "真白萌 Masiro（需登入）",
