@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.7",
+  version: "0.2.8",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -137,16 +137,126 @@ class DefaultExtension extends MProvider {
     return { list, hasNextPage: list.length >= 20 };
   }
 
+  // The site's guarded search sometimes makes the native HTTP client fail
+  // before HTML is returned (including "127.0.0.1:80 connection refused").
+  // Use an ordinary browser-rendered search page first, not fabricated cookies.
+  async searchViaBrowser(searchUrl, word) {
+    if (typeof evaluateJavascriptViaWebview !== "function") {
+      throw new Error("Linovelib：此 Mangayomi 版本沒有背景瀏覽器搜尋功能");
+    }
+    const script = String.raw`(function () {
+      if (window.__linovelibSearch028) return;
+      window.__linovelibSearch028 = true;
+      var sent = false, started = Date.now(), timer = null, last = "", stable = 0;
+      function send(data) {
+        if (sent) return;
+        sent = true;
+        if (timer) clearInterval(timer);
+        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(data));
+      }
+      function poll() {
+        var path = String(location.pathname || "");
+        var title = String(document.title || "");
+        var guarded = /Just a moment|Checking your browser|安全驗證|請稍候/i.test(title) ||
+          !!document.querySelector("#challenge-form, .cf-challenge, #cf-challenge-running");
+        if (!guarded) {
+          var direct = path.match(/^\/novel\/(\d+)\.html$/);
+          if (direct) {
+            var bookName = (document.querySelector('meta[property="og:novel:book_name"]') || {}).content ||
+              (document.querySelector("h1, .book-title") || {}).textContent || "";
+            var cover = (document.querySelector('meta[property="og:image"]') || {}).content || "";
+            send({list: [{name: String(bookName).trim(), link: location.href, imageUrl: cover}], error:"", direct:true});
+            return;
+          }
+          var entries = [], seen = {};
+          var anchors = document.querySelectorAll("ol.book-ol .book-li a.book-layout[href], ol.book-ol a.book-layout[href], .book-ol a.book-layout[href], .book-list a[href*='/novel/'], .book-layout[href*='/novel/']");
+          for (var i = 0; i < anchors.length; i++) {
+            var a = anchors[i];
+            var href = a.getAttribute("href") || "";
+            try { href = new URL(href, location.href).href; } catch (_) { continue; }
+            if (!/\/novel\/\d+\.html(?:[?#].*)?$/i.test(href) || seen[href]) continue;
+            var card = a.closest("li") || a;
+            var label = card.querySelector(".book-title, .book-title-x, .module-slide-caption, h2, h3, h4") || a;
+            var img = card.querySelector("img");
+            var image = img ? (img.getAttribute("data-src") || img.getAttribute("data-original") || img.getAttribute("src") || "") : "";
+            try { if (image) image = new URL(image, location.href).href; } catch (_) { image = ""; }
+            var name = String(label.textContent || img?.alt || "").trim();
+            if (!name) continue;
+            seen[href] = true;
+            entries.push({name:name, link:href, imageUrl:image});
+          }
+          var signature = entries.length + ":" + (entries[0] ? entries[0].link : "");
+          if (entries.length && signature === last) stable++;
+          else {last = signature; stable = 0;}
+          if (entries.length && stable >= 2) { send({list:entries, error:""}); return; }
+          // Empty results may be a blocked/partially rendered page. Never
+          // mistake an unrelated homepage listing for search results.
+          if (Date.now() - started > 11000) {
+            send({list:[], error:"search_page_empty_or_guarded"}); return;
+          }
+        }
+        if (Date.now() - started > 13500) send({list:[], error:"verification_timeout"});
+      }
+      timer = setInterval(poll, 500);
+      poll();
+    })();`;
+    const value = await evaluateJavascriptViaWebview(searchUrl, this.getHeaders(searchUrl), [script], 17);
+    let data;
+    try { data = JSON.parse(String(value || "")); }
+    catch (_) { throw new Error("Linovelib：背景搜尋沒有回傳有效資料"); }
+    if (!data || !Array.isArray(data.list) || data.error) {
+      throw new Error("Linovelib：背景搜尋尚未取得結果（" + String(data?.error || "empty") + "）");
+    }
+    const list = [], seen = new Set();
+    for (const item of data.list) {
+      const link = this.absolute(item?.link, searchUrl);
+      if (!this.bookPath(link) || seen.has(link)) continue;
+      const name = String(item.name || "").trim();
+      if (!name) continue;
+      seen.add(link);
+      list.push({name, link, imageUrl: this.absolute(item.imageUrl, searchUrl) || this.canonicalCover(link)});
+    }
+    return list;
+  }
+
   async search(query, page, filters) {
     const word = String(query || "").trim();
-    if (!word) return this.blank();
+    if (!word || page < 1) return this.blank();
+    const direct = word.match(/(?:^|\/novel\/)(\d+)(?:\.html)?(?:[?#].*)?$/);
+    if (direct) {
+      if (page > 1) return this.blank();
+      const bookUrl = this.source.baseUrl + "/novel/" + direct[1] + ".html";
+      const doc = await this.load(bookUrl);
+      const name = this.attr(doc.selectFirst('meta[property="og:novel:book_name"]'), "content") || this.txt(this.first(doc, [".book-title", "h1"]));
+      if (!name) return this.blank();
+      const imageUrl = this.absolute(this.attr(doc.selectFirst('meta[property="og:image"]'), "content"), bookUrl) || this.canonicalCover(bookUrl);
+      return {list: [{name, link:bookUrl, imageUrl}], hasNextPage:false};
+    }
     const keyword = encodeURIComponent(word);
+    // Do not append searchtype=all: that parameter is absent from the
+    // documented site search route and may trigger a different response.
     const url = page <= 1
-      ? this.source.baseUrl + "/search.html?searchkey=" + keyword + "&searchtype=all"
+      ? this.source.baseUrl + "/search.html?searchkey=" + keyword
       : this.source.baseUrl + "/search/" + keyword + "_" + page + ".html";
-    const doc = await this.load(url);
-    const list = this.listFromPage(doc, url, true);
-    return { list, hasNextPage: list.length >= 20 };
+    let browserError = null;
+    try {
+      const list = await this.searchViaBrowser(url, word);
+      return { list, hasNextPage: list.length >= 20 };
+    } catch (err) { browserError = err; }
+    try {
+      const response = await new Client().get(url, this.getHeaders(url));
+      const status = Number(response?.statusCode || response?.status || 200);
+      const html = String(response?.body || "");
+      if (!html || [403, 429, 503].includes(status) || /jieqiSearchTicket|search_guard|cf-challenge|challenge-platform/i.test(html.slice(0,5000))) {
+        throw new Error("網站搜尋需要額外驗證或回傳非結果頁面");
+      }
+      const doc = new Document(html);
+      const list = this.listFromPage(doc, url, true).list;
+      if (list.length) return {list, hasNextPage:list.length >= 20};
+      throw new Error("搜尋頁面無法辨識書籍清單");
+    } catch (err) {
+      throw new Error("Linovelib：網站搜尋失敗。瀏覽器模式：" + String(browserError) + "；HTTP 模式：" + String(err) + "。若出現 127.0.0.1:80，請檢查 Mangayomi 網路代理或網站搜尋驗證狀態。");
+    }
   }
 
   novelId(url) {

@@ -12,14 +12,14 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/novel543.js",
     "apiUrl": "",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "Novel543; merges multipart chapters"
+    "notes": "v0.3.1: send HTTP request headers, recognize validation pages, browser fallback for site verification (no challenge bypass); keep multipart chapters"
   },
   {
     "name": "嗶哩輕小說（繁體）",
@@ -34,13 +34,13 @@
     "hasCloudflare": true,
     "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js",
     "apiUrl": "",
-    "version": "0.2.7",
+    "version": "0.2.8",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.7: prefix a consecutive catalog-position number to chapter titles to fix Mangayomi sort and false missing-chapter warnings; preserve original titles, URLs, and v0.2.6 chapter recovery/content logic"
+    "notes": "v0.2.8: browser-backed search and direct ID lookup, with HTTP fallback; preserve v0.2.7 chapter ordering/content"
   }
 ]

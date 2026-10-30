@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://www.novel543.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.3.0",
+  version: "0.3.1",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -15,11 +15,86 @@ const mangayomiSources = [{
 
 class DefaultExtension extends MProvider {
   getHeaders(url) {
-    return { "Referer": "https://www.novel543.com/" };
+    return {
+      "Referer": "https://www.novel543.com/",
+      "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7"
+    };
   }
+
+  // A verification page must never be mistaken for the book list or chapter.
+  isVerificationPage(html, statusCode) {
+    const s = String(html || "");
+    if (/cf-challenge|challenge-platform|cf-turnstile|_cf_chl|cdn-cgi\/challenge-platform/i.test(s)) return true;
+    if (/<title[^>]*>[^<]*(?:Just a moment|Checking your browser|Attention Required|請稍候|安全驗證)[^<]*<\/title>/i.test(s)) return true;
+    return [403, 429, 503].includes(Number(statusCode));
+  }
+
+  async loadViaBrowser(url) {
+    if (typeof evaluateJavascriptViaWebview !== "function") {
+      throw new Error("Novel543：目前的 Mangayomi 不支援背景瀏覽器；請先在一般瀏覽器完成網站驗證");
+    }
+    // Ordinary browser navigation; never solve, forge, or skip a verification challenge.
+    const script = String.raw`(function(){
+      if (window.__novel543Read) return;
+      window.__novel543Read = true;
+      var done = false, started = Date.now(), interval;
+      function send(value) {
+        if (done) return;
+        done = true;
+        if (interval) clearInterval(interval);
+        window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
+      }
+      function poll() {
+        var body = document.body;
+        if (body) {
+          var title = String(document.title || "");
+          var markup = document.documentElement.outerHTML || "";
+          var guarded = /Just a moment|Checking your browser|Attention Required|安全驗證|請稍候/i.test(title) ||
+            /cf-challenge|challenge-platform|cf-turnstile|_cf_chl/i.test(markup);
+          if (!guarded && document.querySelector(".media, #detail, .chaplist, .chapter-content, #chapter-content, .read-content, .content")) {
+            send({html: markup, error: ""});
+            return;
+          }
+        }
+        if (Date.now() - started > 14500) send({html: "", error: "verification_or_page_timeout"});
+      }
+      interval = setInterval(poll, 500);
+      poll();
+    })();`;
+    let result;
+    try {
+      result = await evaluateJavascriptViaWebview(url, this.getHeaders(url), [script], 18);
+    } catch (err) {
+      throw new Error("Novel543：背景瀏覽器載入失敗：" + String(err));
+    }
+    let data;
+    try { data = JSON.parse(String(result || "")); }
+    catch (_) { throw new Error("Novel543：背景瀏覽器沒有取得有效網頁；可能需要手動完成驗證"); }
+    if (!data || !data.html || this.isVerificationPage(data.html, 200)) {
+      throw new Error("Novel543：網站需要互動驗證，背景瀏覽器無法自動完成；請稍後重試，或使用支援手動 WebView 驗證的版本（Chrome 的驗證狀態未必與 Mangayomi 共用）");
+    }
+    return new Document(data.html);
+  }
+
   async load(url) {
-    const response = await new Client().get(url);
-    return new Document(response.body);
+    let response, failure;
+    try {
+      response = await new Client().get(url, this.getHeaders(url));
+      const code = Number(response?.statusCode || response?.status || 200);
+      if (response?.body && !this.isVerificationPage(response.body, code)) {
+        return new Document(response.body);
+      }
+    } catch (err) {
+      failure = err;
+    }
+    // A single fallback only. Opening the page in a real browser still may
+    // require user interaction; no synthetic challenge tokens are generated.
+    try { return await this.loadViaBrowser(url); }
+    catch (err) {
+      const cause = failure ? "；原始網路錯誤：" + String(failure) : "";
+      throw new Error(String(err) + cause);
+    }
   }
   absolute(url) {
     if (!url) return "";
