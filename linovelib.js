@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.23",
+  version: "0.2.24",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -36,17 +36,18 @@ class DefaultExtension extends MProvider {
     } catch (_) {}
     if (choice === "8000") return {min:8000, jitter:3000};
     if (choice === "2000") return {min:2000, jitter:2000};
-    // Experimental sequential batch mode. First read up to five page parts
-    // without an artificial pause; pause 2-4s after parts 5, 10, 15, etc.
-    // This increases request rate significantly compared with 5-7s per page
-    // and may trigger HTTP 429 sooner. It never sends parallel requests.
-    if (choice === "batch5") return {mode:"batch5", min:2000, jitter:2000};
+    // Fast-window mode stays below the observed page-11 rate-limit boundary:
+    // read nine parts without an artificial pause, then keep the ninth WebView
+    // open for a 45-60s cooldown before the next navigation. The old batch5
+    // preference is mapped here so an upgrade cannot retain its unsafe pause.
+    if (choice === "sprint9" || choice === "batch5")
+      return {mode:"sprint9", min:45000, jitter:15000};
     return {min:5000, jitter:2000};
   }
 
   chapterPaceAfterPage(pace, pageNumber) {
-    if (pace && pace.mode === "batch5" && pageNumber % 5 !== 0)
-      return {min:0, jitter:0};
+    if (pace && pace.mode === "sprint9" && pageNumber % 9 !== 0)
+      return {mode:"sprint9", min:0, jitter:0};
     return {min:pace.min, jitter:pace.jitter};
   }
 
@@ -1213,6 +1214,13 @@ class DefaultExtension extends MProvider {
     if (typeof evaluateJavascriptViaWebview !== "function") {
       throw new Error("Linovelib：此 Mangayomi 版本不支援背景 WebView");
     }
+    const paceMin = Math.max(0, Math.min(60000,
+      Number.isFinite(Number(pace.min)) ? Number(pace.min) : 5000));
+    const paceJitter = Math.max(0, Math.min(15000,
+      Number.isFinite(Number(pace.jitter)) ? Number(pace.jitter) : 2000));
+    // Allow the WebView to return after a deliberate long cooldown.
+    const webviewTimeout = Math.max(30,
+      Math.ceil((paceMin + paceJitter + 15000) / 1000));
     const script = String.raw`(function () {
       if (window.__linovelibPaced221) return;
       window.__linovelibPaced221 = true;
@@ -1230,7 +1238,7 @@ class DefaultExtension extends MProvider {
         // the success acknowledgement spaces the NEXT network navigation.
         // This timer is a WebView timer, not a QuickJS busy-wait.
         var delay = (value && value.html && value.next)
-          ? ${Math.max(0, Math.min(10000, Number.isFinite(Number(pace.min)) ? Number(pace.min) : 5000))} + Math.floor(Math.random() * ${Math.max(1, Math.min(4000, Number.isFinite(Number(pace.jitter)) ? Number(pace.jitter) : 2000))})
+          ? ${paceMin} + Math.floor(Math.random() * ${paceJitter + 1})
           : 0;
         var send = function () {
           window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
@@ -1386,7 +1394,7 @@ class DefaultExtension extends MProvider {
     let result;
     try {
       result = await evaluateJavascriptViaWebview(
-        chapterUrl, this.getHeaders(chapterUrl), [script], 30
+        chapterUrl, this.getHeaders(chapterUrl), [script], webviewTimeout
       );
     } catch (error) {
       throw new Error("Linovelib：背景載入失敗：" + String(error));
@@ -1438,6 +1446,13 @@ class DefaultExtension extends MProvider {
 
   isRateLimitFailure(error) {
     return /(?:HTTP\s*429|rate_limited|限制請求頻率|請求過於頻繁|Too Many Requests)/i.test(String(error || ""));
+  }
+
+  isLocalWebViewBridgeFailure(error) {
+    const message = String(error || "");
+    return /不支援背景 WebView/i.test(message) ||
+      /(?:localhost|127\.0\.0\.1)[\s\S]{0,180}Connection refused/i.test(message) ||
+      /Connection refused[\s\S]{0,180}(?:localhost|127\.0\.0\.1)/i.test(message);
   }
 
   // A 429 at page 12 should not force a new attempt to re-download pages
@@ -1551,7 +1566,7 @@ class DefaultExtension extends MProvider {
           // Do not double-request a WebView page that failed or was blocked.
           // HTTP is an emergency fallback ONLY when the host app offers no
           // embedded WebView support at all.
-          if (!html && /不支援背景 WebView/.test(String(browserError || "")))
+          if (!html && this.isLocalWebViewBridgeFailure(browserError))
             await tryHttp();
         } else {
           await tryHttp();
@@ -1606,10 +1621,10 @@ class DefaultExtension extends MProvider {
       key: "linovelib_chapter_pace",
       listPreference: {
         title: "章節分頁抓取間隔（WebView）",
-        summary: "預設逐頁等待；實驗批次模式依序讀 5 頁，僅在第 5、10、15... 頁後等待 2～4 秒，可能更快觸發 HTTP 429，並非繞過限流。",
+        summary: "預設逐頁等待；快速測試模式連讀 9 頁，再冷卻 45～60 秒，以避開觀察到的第 11 頁限流。仍不保證免於 429。",
         valueIndex: 0,
-        entries: ["標準慢速：5～7 秒（預設）", "保守慢速：8～11 秒", "較快：2～4 秒", "實驗：每 5 頁連續抓取，批間等 2～4 秒（較易觸發 429）"],
-        entryValues: ["5000", "8000", "2000", "batch5"]
+        entries: ["標準慢速：5～7 秒（預設）", "保守慢速：8～11 秒", "較快：2～4 秒", "快速測試：連續 9 頁，冷卻 45～60 秒"],
+        entryValues: ["5000", "8000", "2000", "sprint9"]
       }
     }];
   }

@@ -32,16 +32,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.23",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.24",
     "apiUrl": "",
-    "version": "0.2.23",
+    "version": "0.2.24",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.23 beta: optional experimental sequential five-page WebView batch (2-4s pause after every five successful parts); default stable 5-7s per-page pacing retained. Does not bypass HTTP 429; retains long-chapter resume cache, text compaction, original URLs and image handling."
+    "notes": "v0.2.24 local beta: optional fast window reads nine pages then cools down 45-60s; legacy batch5 preferences migrate to this safer mode. Adds localhost WebView bridge failure HTTP fallback. Retains 429 resume cache, stable pacing, text compaction, original URLs and images."
   },
   {
     "name": "真白萌 Masiro（需登入）",
