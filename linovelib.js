@@ -6,7 +6,7 @@ const mangayomiSources = [{
   iconUrl: "https://tw.linovelib.com/favicon.ico",
   typeSource: "single",
   itemType: 2,
-  version: "0.2.22",
+  version: "0.2.23",
   dateFormat: "",
   dateFormatLocale: "",
   isNsfw: false,
@@ -36,7 +36,18 @@ class DefaultExtension extends MProvider {
     } catch (_) {}
     if (choice === "8000") return {min:8000, jitter:3000};
     if (choice === "2000") return {min:2000, jitter:2000};
+    // Experimental sequential batch mode. First read up to five page parts
+    // without an artificial pause; pause 2-4s after parts 5, 10, 15, etc.
+    // This increases request rate significantly compared with 5-7s per page
+    // and may trigger HTTP 429 sooner. It never sends parallel requests.
+    if (choice === "batch5") return {mode:"batch5", min:2000, jitter:2000};
     return {min:5000, jitter:2000};
+  }
+
+  chapterPaceAfterPage(pace, pageNumber) {
+    if (pace && pace.mode === "batch5" && pageNumber % 5 !== 0)
+      return {min:0, jitter:0};
+    return {min:pace.min, jitter:pace.jitter};
   }
 
   // Rate-limit protection for this source. Mangayomi's embedded JS runtime
@@ -1219,7 +1230,7 @@ class DefaultExtension extends MProvider {
         // the success acknowledgement spaces the NEXT network navigation.
         // This timer is a WebView timer, not a QuickJS busy-wait.
         var delay = (value && value.html && value.next)
-          ? ${Math.max(0, Math.min(10000, Number(pace.min) || 5000))} + Math.floor(Math.random() * ${Math.max(1, Math.min(4000, Number(pace.jitter) || 2000))})
+          ? ${Math.max(0, Math.min(10000, Number.isFinite(Number(pace.min)) ? Number(pace.min) : 5000))} + Math.floor(Math.random() * ${Math.max(1, Math.min(4000, Number.isFinite(Number(pace.jitter)) ? Number(pace.jitter) : 2000))})
           : 0;
         var send = function () {
           window.flutter_inappwebview.callHandler("setResponse", JSON.stringify(value));
@@ -1524,7 +1535,8 @@ class DefaultExtension extends MProvider {
       };
       const tryBrowser = async () => {
         try {
-          const rendered = await this.readRenderedChapter(currentUrl, chapterPace);
+          const rendered = await this.readRenderedChapter(
+            currentUrl, this.chapterPaceAfterPage(chapterPace, page));
           next = this.checkedContinuation(currentUrl, rendered.next);
           html = rendered.html;
           preferred = "browser";
@@ -1594,10 +1606,10 @@ class DefaultExtension extends MProvider {
       key: "linovelib_chapter_pace",
       listPreference: {
         title: "章節分頁抓取間隔（WebView）",
-        summary: "每成功讀完一個網站分頁後再等候，降低 HTTP 429 風險；長章節會更慢，無法保證免於限流。",
+        summary: "預設逐頁等待；實驗批次模式依序讀 5 頁，僅在第 5、10、15... 頁後等待 2～4 秒，可能更快觸發 HTTP 429，並非繞過限流。",
         valueIndex: 0,
-        entries: ["標準慢速：5～7 秒（預設）", "保守慢速：8～11 秒", "較快：2～4 秒"],
-        entryValues: ["5000", "8000", "2000"]
+        entries: ["標準慢速：5～7 秒（預設）", "保守慢速：8～11 秒", "較快：2～4 秒", "實驗：每 5 頁連續抓取，批間等 2～4 秒（較易觸發 429）"],
+        entryValues: ["5000", "8000", "2000", "batch5"]
       }
     }];
   }

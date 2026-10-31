@@ -32,16 +32,16 @@
     "dateFormatLocale": "",
     "isNsfw": false,
     "hasCloudflare": true,
-    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.22",
+    "sourceCodeUrl": "https://raw.githubusercontent.com/a97101123/novel543-mangayomi/main/linovelib.js?v=0.2.23",
     "apiUrl": "",
-    "version": "0.2.22",
+    "version": "0.2.23",
     "isManga": false,
     "itemType": 2,
     "isFullData": false,
     "appMinVerReq": "0.5.0",
     "additionalParams": "",
     "sourceCodeLanguage": 1,
-    "notes": "v0.2.22 beta: opt-in reversible HTML rendering optimization (default on); preserves original chapter links and WebView pacing. Compacts non-semantic font/span wrappers only for non-obfuscated text, breaks only very long plain paragraphs into smaller render blocks. The app still paginates the entire merged chapter; this is not a full app-side performance fix."
+    "notes": "v0.2.23 beta: optional experimental sequential five-page WebView batch (2-4s pause after every five successful parts); default stable 5-7s per-page pacing retained. Does not bypass HTTP 429; retains long-chapter resume cache, text compaction, original URLs and image handling."
   },
   {
     "name": "真白萌 Masiro（需登入）",
